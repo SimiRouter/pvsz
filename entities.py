@@ -99,6 +99,10 @@ class Sun:
         self.falling = True
         self.alive = True
         self.collect_radius = 30
+        # Eject arc — when > 0, sun pops up before falling. Set by Sunflower.
+        self.eject_t = 0.0           # 0..0.4s eject duration
+        self.eject_vy = 0.0          # initial upward velocity (px/s)
+        self.eject_from_y = float(y)
         self.angle = 0
         self.wobble = random.uniform(-0.05, 0.05)
         self.age = 0.0
@@ -140,6 +144,18 @@ class Sun:
             if self._ct >= 1.0:
                 self.arrived = True
                 self.alive = False
+            return
+        # Eject arc: short upward bounce when Sunflower produces a sun. The
+        # sun pops out of the flower head with a brief 100 px/s upward kick
+        # before gravity (the falling phase) takes over.
+        if self.eject_t > 0:
+            self.eject_t = max(0.0, self.eject_t - dt)
+            self.y += self.eject_vy * dt
+            self.eject_vy += 480 * dt   # gravity pulls the eject back down
+            if self.eject_t <= 0:
+                # hand off to falling — set falling target where we are now
+                self.target_y = self.y
+                self.falling = True
             return
         if self.falling:
             self.y += 60 * dt
@@ -716,6 +732,12 @@ class Sunflower:
             self.glow_timer = 0.6
             sun = Sun(self.x + 30, self.y - 20)
             sun.amount = self.sun_amount
+            # Eject arc: pop the sun up briefly so it visibly leaves the
+            # flower head instead of appearing out of thin air.
+            sun.falling = False
+            sun.eject_t = 0.40
+            sun.eject_vy = -160.0
+            sun.eject_from_y = sun.y
             return sun
 
     def draw(self, screen):
