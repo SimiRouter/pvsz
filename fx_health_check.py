@@ -422,6 +422,44 @@ def t_N3():
 
 
 # ─────────────────────────────────────────────────────────
+# N4 — plant-food rolling collect arc
+# ─────────────────────────────────────────────────────────
+def t_N4():
+    pf = PlantFood(400, 200)
+    pf.target_y = 200   # already at target → settled after one update
+    pf.update(0.016)
+    assert not pf.falling, "plant food should land immediately"
+    # Collect from the air returns False (click is ignored until landed)
+    pf_air = PlantFood(400, 0)
+    pf_air.target_y = 500
+    ok = pf_air.collect((760, 30))
+    assert ok is False, "collect during fall must be rejected"
+    # Settled food: collect succeeds and runs an arc
+    ok = pf.collect((760, 30))
+    assert ok is True
+    assert pf.collected is True
+    initial_y = pf.y
+    # Run to mid-arc and confirm y went up (parabolic peak)
+    mid_done = False
+    for _ in range(120):
+        pf.update(0.016)
+        if pf.collected and pf.y < initial_y and not mid_done:
+            mid_done = True
+    assert mid_done, f"arc should peak above start, y went {initial_y} → {pf.y}"
+    # Arrived: alive flips False and arrived True
+    assert pf.alive is False, "food should arrive and die"
+    assert pf.arrived is True
+    # Draw does not raise
+    pf2 = PlantFood(400, 280)
+    pf2.target_y = 280
+    pf2.update(0.016)
+    pf2.collect((760, 30))
+    surf = pygame.Surface((W, H), pygame.SRCALPHA)
+    surf.fill((80, 130, 70))
+    pf2.draw(surf)
+
+
+# ─────────────────────────────────────────────────────────
 # N2 — wallnut cracks
 # ─────────────────────────────────────────────────────────
 def t_N2():
@@ -464,6 +502,7 @@ tests = [
     ("N1  sunflower_eject",            t_N1),
     ("N2  wallnut_cracks",             t_N2),
     ("N3  cherry_fuse",                t_N3),
+    ("N4  food_arc",                   t_N4),
 ]
 
 
