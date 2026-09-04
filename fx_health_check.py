@@ -394,6 +394,34 @@ def t_N1():
 
 
 # ─────────────────────────────────────────────────────────
+# N3 — cherry-bomb fuse countdown + blink
+# ─────────────────────────────────────────────────────────
+def t_N3():
+    cb = CherryBomb(0, 0, 0)
+    cb.fuse_max = 1.2
+    cb.fuse_timer = 0.0
+    # 1. fuse advances over time
+    for _ in range(10):
+        cb.update(0.016, [])
+    assert cb.fuse_timer > 0.1, f"fuse_timer not advancing: {cb.fuse_timer}"
+    # 2. auto-detonate kicks in before 2s
+    cb2 = CherryBomb(0, 0, 0)
+    # Push fuse past fuse_max (1.2s = 75 frames @ 0.016)
+    for _ in range(80):
+        cb2.update(0.016, [])
+    assert cb2.explode is True, f"cherry should arm explode, got fuse_timer={cb2.fuse_timer}"
+    # explode_timer is set the moment explode flips True; check we still see it.
+    assert cb2.explode_timer > 0, f"explode_timer should be set, got {cb2.explode_timer}"
+    # 3. draw must not raise at any progress
+    surf = pygame.Surface((W, H), pygame.SRCALPHA)
+    surf.fill((80, 130, 70))
+    cb3 = CherryBomb(200, 200, 0)
+    for t in (0.10, 0.40, 0.70, 0.95):
+        cb3.fuse_timer = cb3.fuse_max * t
+        cb3.draw(surf)
+
+
+# ─────────────────────────────────────────────────────────
 # N2 — wallnut cracks
 # ─────────────────────────────────────────────────────────
 def t_N2():
@@ -435,6 +463,7 @@ tests = [
     ("M4  minion_drop",                t_M4),
     ("N1  sunflower_eject",            t_N1),
     ("N2  wallnut_cracks",             t_N2),
+    ("N3  cherry_fuse",                t_N3),
 ]
 
 
