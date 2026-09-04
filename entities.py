@@ -217,9 +217,57 @@ class PlantFood:
         self.alive = True
         self.age = 0.0
         self.settled_age = 0.0
+        # Fly-to-jar curve animation. Mirrors Sun.collect but uses an arc
+        # (up-then-over parabola) and a rolling sprite rotation so the vial
+        # visibly tumbles into the energy jar instead of teleporting.
+        self.collected = False
+        self.arrived = False
+        self._cx0 = 0.0
+        self._cy0 = 0.0
+        self._ctarget = (0.0, 0.0)
+        self._ct = 0.0
+        self._cdur = 0.5
+        self.collect_angle = 0.0
+        self.collect_scale = 1.0
+
+    def collect(self, target):
+        """Start the arc flight into the energy jar; game credits on arrival."""
+        if self.collected or self.falling:
+            # Wait for it to land first — collecting a vial mid-air feels
+            # cheap and clashes with the existing fall-and-bounce motion.
+            return False
+        self.collected = True
+        self.falling = False
+        self._cx0, self._cy0 = self.x, self.y
+        self._ctarget = (float(target[0]), float(target[1]))
+        dist = math.hypot(self._ctarget[0] - self.x, self._ctarget[1] - self.y)
+        self._cdur = max(0.45, min(0.9, dist / 1800.0))
+        self._ct = 0.0
+        self.collect_angle = 0.0
+        self.collect_scale = 1.0
+        return True
 
     def update(self, dt):
         self.age += dt
+        if self.collected:
+            self._ct += dt / self._cdur
+            t = min(1.0, self._ct)
+            # ease-in-out (smoother than t*t) — feels like a real toss
+            ease = t * t * (3.0 - 2.0 * t)
+            self.x = self._cx0 + (self._ctarget[0] - self._cx0) * ease
+            # Parabolic arc: peak height scales with horizontal distance.
+            peak = max(60.0, math.hypot(self._ctarget[0] - self._cx0,
+                                        self._ctarget[1] - self._cy0) * 0.25)
+            self.y = self._cy0 + (self._ctarget[1] - self._cy0) * ease \
+                     - peak * 4.0 * t * (1.0 - t)
+            # Roll the sprite so it visibly tumbles during flight.
+            self.collect_angle += 720.0 * dt
+            # Shrink toward the end so it "lands in" the jar.
+            self.collect_scale = 1.0 - 0.55 * t
+            if self._ct >= 1.0:
+                self.arrived = True
+                self.alive = False
+            return
         if self.falling:
             self.y += 55 * dt
             if self.y >= self.target_y:
@@ -231,6 +279,37 @@ class PlantFood:
                 self.alive = False
 
     def draw(self, screen):
+        if self.collected:
+            cx, cy = int(self.x), int(self.y)
+            # spin + shrink during collect flight
+            r = max(2, int(13 * self.collect_scale))
+            # trailing after-image (only visible mid-flight)
+            if self._ct < 0.7:
+                trail_n = 3
+                for i in range(trail_n):
+                    t_trail = max(0.0, self._ct - 0.05 * (i + 1))
+                    ease_trail = t_trail * t_trail * (3.0 - 2.0 * t_trail)
+                    tx = self._cx0 + (self._ctarget[0] - self._cx0) * ease_trail
+                    ty = self._cy0 + (self._ctarget[1] - self._cy0) * ease_trail
+                    tr = max(2, int(r * (1.0 - 0.15 * (i + 1))))
+                    alpha = 80 - 25 * i
+                    ghost = pygame.Surface((r * 4 + 4, r * 4 + 4), pygame.SRCALPHA)
+                    pygame.draw.circle(ghost, (80, 200, 60, alpha),
+                                       (tr * 2 + 2, tr * 2 + 2), tr)
+                    screen.blit(ghost, ghost.get_rect(center=(int(tx), int(ty))))
+            # main body
+            pygame.draw.circle(screen, (80, 200, 60), (cx, cy), r)
+            pygame.draw.circle(screen, (40, 140, 40), (cx, cy), r, 2)
+            pygame.draw.circle(screen, (220, 255, 200),
+                               (cx - r // 3, cy - r // 3), max(2, r // 3))
+            # lightning-bolt rotated with the roll angle
+            ang = math.radians(self.collect_angle)
+            cos_a, sin_a = math.cos(ang), math.sin(ang)
+            pts = [(-2, -6), (3, -1), (-1, 0), (2, 6)]
+            rot = [(int(cx + x*cos_a - y*sin_a), int(cy + x*sin_a + y*cos_a))
+                   for x, y in pts]
+            pygame.draw.lines(screen, (255, 255, 210), False, rot, 2)
+            return
         pulse = 1.0 + 0.10 * math.sin(self.age * 5)
         glow = _food_glow_cache.get("glow")
         if glow is None:

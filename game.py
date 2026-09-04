@@ -639,16 +639,22 @@ class Game:
             # check plant food drops (能量豆)
             for pf in self.plant_foods[:]:
                 if pf.rect().collidepoint(mx, my):
-                    pf.alive = False
-                    self.plant_foods.remove(pf)
-                    if self.plant_food < PLANT_FOOD_MAX:
-                        self.plant_food += 1
-                        self._play_sound("food", 0.8)
-                        self.floating_texts.append(FloatingText(
-                            int(pf.x), int(pf.y) - 12, tr("Plant food!"),
-                            color=(130, 255, 130), size=20, vy=-50, lifetime=1.1))
-                    else:
+                    # Start the rolling arc into the energy jar — credits
+                    # only land once the vial arrives. This replaces the
+                    # old instant-pickup that made the collect feel cheap.
+                    jar_target = (self.btn_pause.x - 24
+                                  - min(self.plant_food, PLANT_FOOD_MAX - 1) * 22,
+                                  self.btn_pause.centery)
+                    if self.plant_food >= PLANT_FOOD_MAX:
                         self.message.show(tr("Plant food storage is full!"), 1200)
+                        return
+                    if not pf.collect(jar_target):
+                        # Still falling — ignore the click; let it land first.
+                        return
+                    self._play_sound("food", 0.8)
+                    self.floating_texts.append(FloatingText(
+                        int(pf.x), int(pf.y) - 12, tr("Plant food!"),
+                        color=(130, 255, 130), size=20, vy=-50, lifetime=1.1))
                     return
 
             # check sun collection (collected suns are already flying to the jar)
@@ -1579,6 +1585,11 @@ class Game:
                 self.plant_foods.append(pf)
         for pf in self.plant_foods[:]:
             pf.update(dt)
+            if pf.arrived and not pf.alive:
+                # Vial just landed in the jar — credit the player.
+                if self.plant_food < PLANT_FOOD_MAX:
+                    self.plant_food += 1
+                pf.arrived = False   # one-shot
             if not pf.alive:
                 self.plant_foods.remove(pf)
 
