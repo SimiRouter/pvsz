@@ -955,6 +955,13 @@ class CherryBomb:
         # bite_shake decays ±3px horizontal wiggle when zombie is eating us
         shake_amp = (self.bite_shake / 0.18) if self.bite_shake > 0 else 0.0
         dx = int(math.sin(self.fuse_timer * 60) * 3 * shake_amp)
+        # --- Fuse visual: progress 0..1, color shifts green→yellow→red and
+        #     flash rate climbs so the cherry pulses faster the closer it is
+        #     to detonation. Blink is a sin wave (0..1..0) at a frequency
+        #     that itself scales with progress.
+        progress = min(1.0, self.fuse_timer / self.fuse_max) if not self.explode else 1.0
+        blink_hz = 1.5 + progress * 6.0   # 1.5 Hz at start → 7.5 Hz at fuse end
+        blink = (math.sin(self.fuse_timer * blink_hz * 2.0 * math.pi) + 1.0) * 0.5
         if img is not None:
             if self.explode:
                 # bright explosion overlay
@@ -963,13 +970,37 @@ class CherryBomb:
                 pygame.draw.circle(flash, (255, 200, 100, 180), (self.w // 2 + 10, self.h // 2 + 10), 35)
                 screen.blit(flash, (self.x - 10 + dx, self.y - 10 - dy))
             else:
+                # Red tint overlay that pulses faster as the fuse nears zero.
                 screen.blit(img, (self.x + dx, self.y - dy))
+                if progress > 0.2:
+                    tint = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
+                    tint_alpha = int((80 + 100 * blink) * min(1.0, (progress - 0.2) / 0.8))
+                    tint.fill((255, 60, 60, tint_alpha))
+                    screen.blit(tint, (self.x + dx, self.y - dy))
             # fuse spark when close to detonation
-            progress = self.fuse_timer / self.fuse_max
             if not self.explode and progress > 0.4:
                 spark_size = 4 + int(progress * 4)
                 spark_color = (255, int(200 * (1 - progress)), 0)
                 pygame.draw.circle(screen, spark_color, (int(self.x + self.w // 2 + dx), int(self.y + 8)), spark_size)
+            # --- Fuse countdown bar above the cherry (only while armed)
+            if not self.explode:
+                bar_w = self.w
+                bar_h = 4
+                bx = int(self.x)
+                by = int(self.y - 8)
+                pygame.draw.rect(screen, COLOR_BAR_BG, (bx, by, bar_w, bar_h))
+                # color: green → yellow → red as progress climbs
+                if progress < 0.5:
+                    bar_color = (90 + int(160 * progress * 2), 200, 60)
+                else:
+                    p2 = (progress - 0.5) * 2
+                    bar_color = (250, int(200 * (1 - p2)), 60)
+                fill_w = int(bar_w * progress)
+                pygame.draw.rect(screen, bar_color, (bx, by, fill_w, bar_h))
+                # red border tightens when flashing
+                if blink > 0.5:
+                    pygame.draw.rect(screen, (255, 50, 50),
+                                     (bx - 1, by - 1, bar_w + 2, bar_h + 2), 1)
         else:
             color = (220, 20, 20) if not self.explode else (255, 100, 0)
             pygame.draw.circle(screen, color, (int(self.x + 30 + dx), int(self.y + 30)), 18)
