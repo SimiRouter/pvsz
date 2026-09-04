@@ -816,6 +816,37 @@ class Wallnut:
         else:
             return "anim_wallnut_verycracked"
 
+    def _crack_overlay(self, screen):
+        """Procedural crack overlay — drawn ON TOP of the wallnut sprite.
+        Number of cracks grows with damage; cracks are jittered zig-zag lines
+        that radiate from bite marks. Always visible (not just at thresholds).
+        """
+        damage = 1.0 - (self.hp / self.max_hp)   # 0..1 as wallnut is chewed
+        if damage <= 0.05:
+            return  # pristine — no cracks yet
+        n_cracks = int(1 + damage * 5)           # 1..6 cracks
+        # center of the visible sprite (relative to the sprite box)
+        cx = self.x + self.w // 2
+        cy = self.y + self.h // 2 - 4
+        rng = random.Random(int(self.x) * 31 + int(self.y))  # deterministic per plant
+        for _ in range(n_cracks):
+            # random bite anchor on the wallnut body
+            bx = cx + rng.randint(-22, 22)
+            by = cy + rng.randint(-22, 22)
+            # zig-zag crack with 3-5 segments
+            n_segs = rng.randint(3, 5)
+            pts = [(bx, by)]
+            for s in range(n_segs):
+                last = pts[-1]
+                # each segment drifts away from bite and varies direction
+                pts.append((last[0] + rng.randint(-7, 7),
+                            last[1] + rng.randint(-9, 9)))
+            # darker shade as wallnut gets chewed
+            shade = 50 + int(60 * damage)
+            color = (shade, shade // 2, shade // 3)
+            for i in range(len(pts) - 1):
+                pygame.draw.line(screen, color, pts[i], pts[i + 1], 2)
+
     def draw(self, screen):
         prefix = self._crack_state()
         frame_idx = int(self.anim_time * 6) % 6
@@ -833,6 +864,8 @@ class Wallnut:
             else:
                 pygame.draw.ellipse(screen, (160, 120, 60), (self.x + 5 + dx, self.y + 10, 50, 45))
                 pygame.draw.ellipse(screen, (180, 140, 80), (self.x + 15 + dx, self.y + 15, 30, 35))
+        # Procedural crack overlay on top of the sprite (1..6 cracks)
+        self._crack_overlay(screen)
         self._draw_hp(screen)
 
     def _draw_hp(self, screen):
