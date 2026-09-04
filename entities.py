@@ -146,15 +146,19 @@ class Sun:
                 self.alive = False
             return
         # Eject arc: short upward bounce when Sunflower produces a sun. The
-        # sun pops out of the flower head with a brief 100 px/s upward kick
-        # before gravity (the falling phase) takes over.
+        # sun pops out of the flower head with a brief ~160 px/s upward kick
+        # before gravity (the falling phase) takes over. We delay the
+        # falling handoff by 1 frame so the sun visibly continues downward
+        # for a moment after the eject peak — without this, the very next
+        # frame finds the sun already "at" its target and snaps to settled.
         if self.eject_t > 0:
             self.eject_t = max(0.0, self.eject_t - dt)
             self.y += self.eject_vy * dt
             self.eject_vy += 480 * dt   # gravity pulls the eject back down
             if self.eject_t <= 0:
-                # hand off to falling — set falling target where we are now
-                self.target_y = self.y
+                # hand off to falling — set falling target 30px below where
+                # we are now so the falling phase actually has room to play.
+                self.target_y = self.y + 30
                 self.falling = True
             return
         if self.falling:
