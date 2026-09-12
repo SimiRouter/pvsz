@@ -17,6 +17,11 @@ from levels import ADVENTURE_LEVELS, SURVIVAL_MODES, POOL_WATER_ROWS
 from main import _viewport, _to_logical
 from ui import LevelSelectScreen, SeedSelectScreen
 
+# Redirect the save file into TMPDIR so the adventure-completion test below
+# never pollutes the real save.json shipped with the project.
+import save as save_mod
+save_mod.SAVE_PATH = os.path.join(os.environ.get("TMPDIR", "/tmp"), "pvsz_smoke_save.json")
+
 
 def test_viewports():
     for size in ((640, 360), (800, 600), (1024, 768), (1400, 600),
@@ -90,10 +95,88 @@ def test_mouse_seed_guard_and_preview():
     assert g.grid.hover_cell == (2, 2)
     g.draw()  # placement preview path
 
+    # Cob Cannon follows a deliberate arm-then-target interaction and must not
+    # crash or steal a click intended for a selected seed card.
+    g.sun_value = 9999
+    g.plant_cooldowns.clear()
+    assert g._plant(PLANT_COBCANNON, (0, 0))
+    cob = g._first_cob_cannon()
+    btn.selected = True
+    target = g.grid.get_cell_center(1, 1)
+    g.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN,
+                                      {"pos": target, "button": 1}))
+    assert g._cell_plant(1, target[0]).plant_type == PLANT_PEASHOOTER
+    btn.selected = False
+    g.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN,
+                                      {"pos": (cob.x + 20, cob.y + 20), "button": 1}))
+    g.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN,
+                                      {"pos": target, "button": 1}))
+    assert len(g.projectiles) == 1 and not g._cob_armed
+
+
+def test_zombie_animation_frames():
+    # The shipped zombie strips contain seven cells (the old six-cell slice
+    # made the walking sprite jump/disappear between frames).
+    for prefix in ("anim_zombie_a_idle", "anim_zombie_b_idle"):
+        frames = assets_loader.anim_frames(prefix)
+        assert len(frames) == 7
+        assert all(frame.get_bounding_rect(min_alpha=16).width > 0 for frame in frames)
+
+
+def test_sun_lifecycle():
+    # Full 阳光 life cycle in one compact assertion block (see
+    # dev_verify_sun.py for the expanded behavioral audit).
+    from entities import Sun
+    s = Sun(400, -40); s.drop_from_sky(400.0)
+    assert s.phase == "fall" and s.falling
+    while s.phase == "fall":
+        s.update(1/60)
+    assert s.phase == "bounce" and not s.falling  # grabbable mid-bounce
+    while s.phase == "bounce":
+        s.update(1/60)
+    assert s.phase == "rest"
+    assert s.squash > 0.0           # final impact squashes too (settle thud)
+    for _ in range(20):
+        s.update(1/60)              # ~0.33s later the squash has decayed away
+    assert s.squash == 0.0
+    # hover freeze: motion suspends while the game reports the sun hovered,
+    # spin keeps turning; resumes the moment hover leaves (阳光停在光标下).
+    # Track the *visual* center — the resting bob is draw-only, so physics y
+    # would sit still even without the freeze.
+    v0 = s._visual_center()
+    for _ in range(30):
+        s.update(1/60, hovered=True)
+    assert s._visual_center() == v0 and s.angle > 0
+    s.update(1/60, hovered=False)
+    assert s._visual_center() != v0
+    # circular hit test matches the drawn bob position, not raw physics
+    cx, cy = s._visual_center()
+    assert s.contains(cx, cy)
+    d = SUN_COLLECT_RADIUS
+    assert not s.contains(cx + d - 1, cy + d - 1)   # square corner excluded
+    # collect: credits only on arrival, flight unaffected by hover
+    s.collect((70, 40))
+    px = s.x
+    for _ in range(5):
+        s.update(1/60, hovered=True)
+    assert s.x != px and not s.arrived  # hover does not stall the flight
+    while s.alive and not s.arrived:
+        s.update(1/60)
+    assert s.arrived
+    # expiry: blink phase near end of life, restores alpha when collected
+    e = Sun(500, 300); e.phase = "rest"; e.falling = False
+    e.settled_age = e.lifetime() - Sun.EXPIRE_WARN_S + 0.05
+    for _ in range(12):
+        e.update(1/60)              # blink can sample high right at entry
+    assert e.phase == "fading" and e.alpha < 255
+    e.collect((70, 40))
+    assert e.alpha == 255
+
 
 def main():
     test_viewports(); test_ui_bounds(); test_survival_reset_and_space()
-    test_mouse_seed_guard_and_preview(); test_adventure()
+    test_mouse_seed_guard_and_preview(); test_zombie_animation_frames()
+    test_sun_lifecycle(); test_adventure()
     print("ALL SMOKE TESTS PASSED")
 
 

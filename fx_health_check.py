@@ -17,8 +17,12 @@ pygame.display.set_mode((1400, 600))
 import assets_loader
 assets_loader.init()
 from constants import *
+# Never touch the shipped save: health checks run against a scratch file.
+import save as save_mod
+save_mod.SAVE_PATH = os.path.join(os.environ.get("TMPDIR", "/tmp"), "pvsz_fxhealth_save.json")
 from game import Game
 from entities import *
+from wave import WaveSystem
 import fx as fx_mod
 
 
@@ -33,6 +37,21 @@ def check(name, fn):
     except Exception as e:
         tb = traceback.format_exc(limit=2).strip().splitlines()
         results.append((name, "FAIL", f"{type(e).__name__}: {e} | {tb[-1] if tb else ''}"))
+
+
+def fx_parts(g, kind=None, layer=None):
+    """Particles currently alive in the unified system (particles.Effects).
+
+    The per-effect lists this file used to poke at (``g.plant_debris``,
+    ``g.pea_impact`` …) are gone — every effect now lives in ``g.fx``. These
+    checks assert on the same observable event, just through the one system.
+    """
+    pool = list(g.fx.air) + list(g.fx.ground)
+    if kind is not None:
+        pool = [p for p in pool if p.kind == kind]
+    if layer is not None:
+        pool = [p for p in pool if p.layer == layer]
+    return pool
 
 
 def fresh_game(start_level=True):
@@ -67,11 +86,12 @@ def t_B():
     for _ in range(60):
         g.update(0.016)
     p.alive = False
-    initial_debris = len(g.plant_debris)
+    initial_debris = len(fx_parts(g, "leaf"))
     for _ in range(5):
         g.update(0.016)
-    assert len(g.plant_debris) > initial_debris, (
-        f"plant_debris not spawned: was {initial_debris}, now {len(g.plant_debris)}")
+    assert len(fx_parts(g, "leaf")) > initial_debris, (
+        f"plant_debris not spawned: was {initial_debris}, "
+        f"now {len(fx_parts(g, 'leaf'))}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -88,11 +108,11 @@ def t_C():
     g.zombies.append(z)
     proj = Projectile(700, g.grid.y + 2 * CELL_H + 8, 2)
     g.projectiles.append(proj)
-    pre = len(g.pea_impact)
+    pre = len(fx_parts(g, "dot")) + len(fx_parts(g, "ring"))
     for _ in range(40):
         g.update(0.016)
-    assert len(g.pea_impact) > pre, (
-        f"pea_impact not spawned: was {pre}, now {len(g.pea_impact)}")
+    now = len(fx_parts(g, "dot")) + len(fx_parts(g, "ring"))
+    assert now > pre, f"pea_impact not spawned: was {pre}, now {now}"
 
 
 # ─────────────────────────────────────────────────────────
@@ -106,12 +126,14 @@ def t_E():
     z.base_speed = 0.0
     z.speed = 0.0
     g.zombies.append(z)
-    pre = len(g.zombie_heads)
+    pre = len(fx_parts(g, "chunk"))
     z.take_damage(99999)
+    spawned = False
     for _ in range(80):
         g.update(0.016)
-    assert len(g.zombie_heads) > pre, (
-        f"zombie_heads not spawned: was {pre}, now {len(g.zombie_heads)}")
+        if len(fx_parts(g, "chunk")) > pre:
+            spawned = True
+    assert spawned, f"zombie_heads never spawned (chunks stay at {pre})"
 
 
 # ─────────────────────────────────────────────────────────
@@ -125,11 +147,11 @@ def t_F():
     g.zombies.append(z)
     z.hp = 1
     z.take_damage(BALLOON_HP + 1)
-    pre = len(g.balloon_pop)
+    pre = len(fx_parts(g, "shred"))
     for _ in range(5):
         g.update(0.016)
-    assert len(g.balloon_pop) > pre, (
-        f"balloon_pop not spawned: was {pre}, now {len(g.balloon_pop)}")
+    assert len(fx_parts(g, "shred")) > pre, (
+        f"balloon_pop not spawned: was {pre}, now {len(fx_parts(g, 'shred'))}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -137,7 +159,7 @@ def t_F():
 # ─────────────────────────────────────────────────────────
 def t_G():
     g = fresh_game()
-    pre = len(g.mow_dust)
+    pre = len(fx_parts(g, "puff"))
     z = g.zombies[0] if g.zombies else None
     if z is None:
         from entities import create_zombie
@@ -148,8 +170,8 @@ def t_G():
     m.activate()
     for _ in range(5):
         g.update(0.016)
-    assert len(g.mow_dust) > pre, (
-        f"mow_dust not spawned: was {pre}, now {len(g.mow_dust)}")
+    assert len(fx_parts(g, "puff")) > pre, (
+        f"mow_dust not spawned: was {pre}, now {len(fx_parts(g, 'puff'))}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -159,7 +181,10 @@ def t_H():
     g = fresh_game()
     g._plant("peashooter", (2, 3))
     g._dig_up((2, 3))
-    assert len(g.plant_poof) == 2, f"plant_poof expected 2 (plant+dig), got {len(g.plant_poof)}"
+    # Each soil poof is one ground-layer puff plus four airborne clods.
+    puffs = fx_parts(g, "puff", layer=0)
+    assert len(puffs) == 2, f"soil poof expected 2 (plant+dig), got {len(puffs)}"
+    assert len(fx_parts(g, "dot")) >= 8, "soil clods missing from the poof"
 
 
 # ─────────────────────────────────────────────────────────
@@ -169,10 +194,10 @@ def t_I():
     g = fresh_game()
     g._plant("peashooter", (2, 3))
     g.plant_food = 1
-    pre = len(g.food_rings)
+    pre = len(fx_parts(g, "ring"))
     g._feed_plant(g.plants[0])
-    assert len(g.food_rings) == pre + 2, (
-        f"food_rings expected 2, got {len(g.food_rings) - pre}")
+    assert len(fx_parts(g, "ring")) == pre + 2, (
+        f"food_rings expected 2, got {len(fx_parts(g, 'ring')) - pre}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -184,11 +209,14 @@ def t_J():
     boss = create_zombie(900, 200, 0, ZOMBIE_BOSS)
     boss.grid_y = g.grid.y
     g.zombies.append(boss)
-    pre = len(g.boss_aura)
+    pre_ring = len(fx_parts(g, "ring"))
+    pre_dot = len(fx_parts(g, "dot"))
     g._spawn_boss_aura(boss, kind="summon")
-    assert len(g.boss_aura) == pre + 4, "summon aura = 1 ring + 3 sparks"
+    assert len(fx_parts(g, "ring")) == pre_ring + 1, "summon aura = 1 ring"
+    assert len(fx_parts(g, "dot")) == pre_dot + 4, "summon aura = 4 sparks"
     g._spawn_boss_aura(boss, kind="death")
-    assert len(g.boss_aura) == pre + 4 + 14, "death aura = +2 ring + 12 sparks"
+    assert len(fx_parts(g, "ring")) == pre_ring + 3, "death aura = +2 rings"
+    assert len(fx_parts(g, "dot")) == pre_dot + 4 + 14, "death aura = +12 sparks"
 
 
 # ─────────────────────────────────────────────────────────
@@ -196,14 +224,20 @@ def t_J():
 # ─────────────────────────────────────────────────────────
 def t_K1():
     s = Sun(300, 0)
-    s.target_y = 50      # close to start, so it lands fast
-    landed = False
-    for _ in range(80):
+    s.drop_from_sky(50)          # close to start, so it lands fast
+    y_at_land = None
+    rebounded = False
+    for _ in range(400):
         s.update(0.016)
-        if not s.falling and s.bounce_t < 1.0:
-            landed = True
-            break
-    assert landed, f"sun did not bounce on landing: falling={s.falling}, bounce_t={s.bounce_t}"
+        if s.phase == "bounce":
+            if y_at_land is None:
+                y_at_land = s.y
+            elif s.y < y_at_land - 2.0:
+                rebounded = True
+                break
+    assert rebounded, (
+        f"sun never rebounded off the lawn: phase={s.phase} y={s.y:.1f}")
+    assert s.squash >= 0.0, "impact squash should be reset non-negative"
 
 
 # ─────────────────────────────────────────────────────────
@@ -215,11 +249,20 @@ def t_K2():
     z = create_zombie(900, g.grid.y + 2 * CELL_H + 15, 2, ZOMBIE_BASIC)
     z.grid_y = g.grid.y
     g.zombies.append(z)
-    pre = len(g.grass_prints)
-    for _ in range(120):
+    # A print lives ~1.1 s while a stride takes ~1.7 s, so sample the count
+    # every frame rather than only at the end — the last print may already
+    # have faded by the time the loop finishes.
+    peak = 0
+    peak_layer = 0
+    for _ in range(200):
         g.update(0.016)
-    assert len(g.grass_prints) > pre, (
-        f"grass_prints not spawned: was {pre}, now {len(g.grass_prints)}")
+        prints = fx_parts(g, "print")
+        peak = max(peak, len(prints))
+        peak_layer = max(peak_layer, len([p for p in prints if p.layer == 0]))
+    assert peak > 0, "grass_prints never spawned while a zombie walked"
+    assert peak_layer == peak, (
+        "footprints must render in the ground layer (under the actors), "
+        f"got {peak - peak_layer} airborne")
 
 
 # ─────────────────────────────────────────────────────────
@@ -384,13 +427,21 @@ def t_N1():
     sf = Sunflower(400, 300, 2)
     sf.cooldown = 0.01
     s = sf.update(0.016, [])
-    assert s is not None and s.eject_t > 0, "sun not ejected"
-    assert s.eject_vy < 0, f"sun should pop up, got v={s.eject_vy}"
-    # After 0.4s, eject ends and falling takes over
-    for _ in range(40):
+    assert s is not None and s.phase == "eject", "sun not ejected"
+    assert s.vy < 0, f"sun should pop up, got v={s.vy}"
+    # The pop must arc: rise first, then hand off to a gravity descent.
+    start_y = s.y
+    peak_y = start_y
+    for _ in range(120):
         s.update(0.016)
-    assert s.eject_t == 0 and s.falling is True, (
-        f"eject should hand off to falling, got eject_t={s.eject_t} falling={s.falling}")
+        peak_y = min(peak_y, s.y)
+        if s.phase == "fall":
+            break
+    assert peak_y < start_y - 10, (
+        f"eject should visibly rise, went {start_y:.0f} -> {peak_y:.0f}")
+    assert s.phase in ("fall", "bounce", "rest"), (
+        f"eject should hand off to a descent, got phase={s.phase}")
+    assert s.vy >= 0, f"should be descending after the pop, vy={s.vy}"
 
 
 # ─────────────────────────────────────────────────────────
@@ -426,12 +477,12 @@ def t_N3():
 # ─────────────────────────────────────────────────────────
 def t_N4():
     pf = PlantFood(400, 200)
-    pf.target_y = 200   # already at target → settled after one update
+    pf.drop_from_sky(200)   # already at target → lands on the first step
     pf.update(0.016)
-    assert not pf.falling, "plant food should land immediately"
+    assert not pf.falling, f"plant food should land immediately, phase={pf.phase}"
     # Collect from the air returns False (click is ignored until landed)
     pf_air = PlantFood(400, 0)
-    pf_air.target_y = 500
+    pf_air.drop_from_sky(500)
     ok = pf_air.collect((760, 30))
     assert ok is False, "collect during fall must be rejected"
     # Settled food: collect succeeds and runs an arc
@@ -451,7 +502,7 @@ def t_N4():
     assert pf.arrived is True
     # Draw does not raise
     pf2 = PlantFood(400, 280)
-    pf2.target_y = 280
+    pf2.drop_from_sky(280)
     pf2.update(0.016)
     pf2.collect((760, 30))
     surf = pygame.Surface((W, H), pygame.SRCALPHA)
@@ -460,11 +511,146 @@ def t_N4():
 
 
 # ─────────────────────────────────────────────────────────
+# P1 — the Director actually adapts to what the player built
+# ─────────────────────────────────────────────────────────
+def _board(plants):
+    """Point ai.intel at a plant layout. Returns a Director bound to it.
+
+    The Director reads the *module-level* intel, so this must be re-called
+    immediately before every profile()/compose() — building two Directors and
+    then comparing them would have both read whichever board was refreshed
+    last, which is exactly the trap the real code avoids by refreshing intel
+    once per frame.
+    """
+    import ai
+    ai.refresh_intel(list(plants))
+    return ai.Director()
+
+
+def t_P1():
+    import collections
+    import ai
+    from levels import ADVENTURE_LEVELS
+
+    # --- 1. a level only ever spawns types it has already introduced -------
+    ws = WaveSystem()
+    ws.waves = ADVENTURE_LEVELS[0]["waves"]      # 1-1: two waves of basic only
+    ws.wave_count = len(ws.waves)
+    assert not ws._ai_unlocked(), "1-1 must not unlock AI zombies"
+    assert ws._allowed_types() == {ZOMBIE_BASIC}, (
+        f"wave 1 of 1-1 unlocked too much: {ws._allowed_types()}")
+
+    # --- 2. the same board, two very different defenses -------------------
+    # Wall line: the answer is to go over/under it, not through it.
+    wall_board = [Wallnut(GRID_X + 6 * CELL_W, GRID_Y + r * CELL_H, r)
+                  for r in range(GRID_ROWS)]
+    # Massed shooters: the answer is to out-tank them.
+    shooter_board = [Peashooter(GRID_X + c * CELL_W, GRID_Y + r * CELL_H, r)
+                     for r in range(GRID_ROWS) for c in range(1, 4)]
+
+    # intel is a single module-level snapshot, so read each profile straight
+    # after pointing it at the matching board.
+    p_wall = _board(wall_board).profile()
+    p_shoot = _board(shooter_board).profile()
+    assert p_wall != "default", "a wall line must not profile as default"
+    assert p_shoot == "shooters", f"3 peashooters per row read as {p_shoot!r}"
+    assert p_wall != p_shoot, (
+        f"walls and shooters must profile differently, both read {p_wall!r}")
+
+    # --- 3. composition follows the profile -------------------------------
+    pool = {ZOMBIE_BASIC, ZOMBIE_CONEHEAD, ZOMBIE_BUCKETHEAD, ZOMBIE_FLAG,
+            ZOMBIE_POLE, ZOMBIE_DIGGER, ZOMBIE_TACTICIAN, ZOMBIE_HEALER,
+            ZOMBIE_COMMANDER}
+    scripted = [ZOMBIE_BASIC, ZOMBIE_CONEHEAD]
+
+    def rosters(board, draws=40):
+        """Total type counts over many waves against one board layout."""
+        total = collections.Counter()
+        for _ in range(draws):
+            d = _board(board)          # re-point intel before every compose
+            total += collections.Counter(
+                d.compose(scripted, 40, pool, unlock_ai=True))
+        return total
+
+    wall_counts = rosters(wall_board)
+    shoot_counts = rosters(shooter_board)
+
+    assert wall_counts[ZOMBIE_POLE] > shoot_counts[ZOMBIE_POLE], (
+        "a wall line should draw more pole-vaulters than a shooter line: "
+        f"{wall_counts[ZOMBIE_POLE]} vs {shoot_counts[ZOMBIE_POLE]}")
+    assert shoot_counts[ZOMBIE_BUCKETHEAD] > wall_counts[ZOMBIE_BUCKETHEAD], (
+        "massed shooters should draw more bucketheads than a wall line: "
+        f"{shoot_counts[ZOMBIE_BUCKETHEAD]} vs {wall_counts[ZOMBIE_BUCKETHEAD]}")
+
+    # --- 4. adaptation never erases the script ----------------------------
+    for _ in range(40):
+        out = _board(wall_board).compose(scripted, 10, pool, unlock_ai=True)
+        assert len(out) == 10, f"compose returned {len(out)} of 10"
+        assert out.count(ZOMBIE_BASIC) + out.count(ZOMBIE_CONEHEAD) >= 1, (
+            "every wave must keep at least one scripted zombie")
+
+    # --- 4b. each defense maps to the counter that beats it ---------------
+    # Threats are scored from plant_type/hp/row only, so a flat x is fine.
+    def layout(spec):
+        out = []
+        for cls, col, row in spec:
+            out.append(cls(GRID_X + col * CELL_W, GRID_Y + row * CELL_H, row))
+        return out
+
+    rows = range(GRID_ROWS)
+    cases = [
+        ("a wall line", "walls",
+         [(Wallnut, c, r) for r in rows for c in (5, 6)]),
+        ("massed shooters", "shooters",
+         [(Peashooter, c, r) for r in rows for c in (1, 2, 3)]),
+        ("a sun-heavy turtle", "economy",
+         [(Sunflower, c, r) for r in rows for c in (0, 1, 2)]
+         + [(Peashooter, 3, 2)]),
+        ("one overloaded lane", "stacked",
+         [(Peashooter, c, 0) for c in (1, 2, 3, 4)]
+         + [(Sunflower, 0, 1), (Sunflower, 0, 3)]),
+        ("walls plus guns", "walls",
+         [(Wallnut, 6, r) for r in rows] + [(Peashooter, 2, r) for r in rows]),
+        # Regression: one peashooter among sunflowers used to out-score the
+        # 2.2x mean test on a tiny threat total and read as a "stacked lane".
+        ("a lone peashooter", "default",
+         [(Peashooter, 2, 0), (Sunflower, 0, 2)]),
+        ("a bare lawn", "default", []),
+    ]
+    for label, expect, spec in cases:
+        got = _board(layout(spec)).profile()
+        assert got == expect, f"{label} should profile as {expect!r}, got {got!r}"
+
+    # --- 5. the row pick favours the weak lane ----------------------------
+    # One heavily-defended row, one bare row: the bare one should see more.
+    lopsided = [Peashooter(GRID_X + c * CELL_W, GRID_Y + 0 * CELL_H, 0)
+                for c in range(1, 8)]
+    d_row = _board(lopsided)
+    picks = collections.Counter(d_row.choose_row() for _ in range(400))
+    assert picks[0] < 400 / GRID_ROWS, (
+        f"overloaded row should be under-picked, got {picks[0]} of 400")
+    assert max(picks, key=lambda r: picks[r]) != 0, (
+        f"spawns should avoid the overloaded row, got {dict(picks)}")
+
+    # --- 6. the Director is actually wired into WaveSystem ---------------
+    ws2 = WaveSystem()
+    ws2.waves = ADVENTURE_LEVELS[-1]["waves"]    # 5-4: names AI zombies
+    ws2.wave_count = len(ws2.waves)
+    assert ws2._ai_unlocked(), "5-4 names AI zombies, so they must unlock"
+    assert ws2.director is not None
+    assert ws2.director.enabled == DIRECTOR_ENABLED
+    # Rows are deferred to spawn time so they track the live board.
+    assert ws2.start_wave() is True
+    assert all(row is None for _t, row in ws2.zombies_to_spawn), (
+        "rows should be resolved at spawn, not queued up front")
+    assert len(ws2.zombies_to_spawn) == ws2.wave_zombies_remaining
+
+
+# ─────────────────────────────────────────────────────────
 # N2 — wallnut cracks
 # ─────────────────────────────────────────────────────────
 def t_N2():
     w = Wallnut(0, 0, 2)
-    pristine = w._crack_overlay  # exists
     w.hp = w.max_hp * 0.5
     surface = pygame.Surface((W, H), pygame.SRCALPHA)
     surface.fill((80, 130, 70))
@@ -503,6 +689,7 @@ tests = [
     ("N2  wallnut_cracks",             t_N2),
     ("N3  cherry_fuse",                t_N3),
     ("N4  food_arc",                   t_N4),
+    ("P1  director_adapts",            t_P1),
 ]
 
 

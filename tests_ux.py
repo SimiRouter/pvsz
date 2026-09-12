@@ -12,6 +12,9 @@ SCREEN = pygame.display.set_mode((1400, 600))
 import assets_loader
 assets_loader.init()
 from constants import *
+# Never touch the shipped save: UX checks run against a scratch file.
+import save as save_mod
+save_mod.SAVE_PATH = os.path.join(os.environ.get("TMPDIR", "/tmp"), "pvsz_ux_save.json")
 from game import Game
 import i18n
 
@@ -248,9 +251,15 @@ def test_new_content():
     # --- plant food: drop → collect → feed peashooter boost ---
     from entities import PlantFood
     g3.plant_food = 0
-    pf = PlantFood(700, 300); pf.falling = False
+    pf = PlantFood(700, 300)
+    pf.drop_from_sky(300)        # land on the spot so the click is accepted
+    pf.update(0.016)
     g3.plant_foods.append(pf)
     click(g3, 700, 300)
+    # Collection is an animated arc; the counter/list update when it reaches
+    # the jar rather than on the initial click.
+    for _ in range(60):
+        g3.update(0.016)
     assert g3.plant_food == 1 and not g3.plant_foods
     peashooter = g3._cell_plant(2, g3.grid.get_cell_center(2, 4)[0])
     click(g3, int(peashooter.x + peashooter.w // 2), int(peashooter.y + 30))
@@ -267,6 +276,20 @@ def test_new_content():
     assert sp30 > 1.5 and dm30 > 2.0, "endless waves scale speed & attack"
     zb3 = create_zombie(0, 0, 0, ZOMBIE_BASIC, sp30, dm30)
     assert zb3.speed > zb3.base_speed and zb3.eat_damage > 30
+
+    # un-frozen zombies keep their authored speed; footsteps are animation-step
+    # paced rather than emitted once per frame.
+    walker = create_zombie(900, g4.grid.y + 15, 0, ZOMBIE_BASIC)
+    x0 = walker.x
+    walker.update(0.1, [])
+    assert abs((x0 - walker.x) - walker.base_speed * 0.1) < 1e-6
+    g4.zombies = [walker]
+    for _ in range(60):
+        g4.update(0.016)
+    # Footprints now live in the shared particle system's ground layer, and
+    # are paced by the distance-driven walk cycle rather than one per frame.
+    prints = [p for p in g4.fx.ground if p.kind == "print"]
+    assert len(prints) <= 4, f"footprints outran the stride: {len(prints)}"
 
     # --- screenshot with the new zombies on the lawn ---
     g5 = Game(SCREEN)
