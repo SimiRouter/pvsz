@@ -9,6 +9,7 @@ import math
 import random
 
 import pygame
+import fade_cache
 import i18n
 tr = i18n.tr
 from constants import COLOR_WHITE, COLOR_RED, COLOR_YELLOW, SCREEN_WIDTH
@@ -43,10 +44,41 @@ def cached_text(text, size, color, outline=None):
 
 def faded(surface, alpha):
     """A copy of ``surface`` at the given 0-255 alpha (cached surfaces must
-    never be mutated in place — they are shared)."""
-    out = surface.copy()
-    out.set_alpha(int(max(0, min(255, alpha))))
-    return out
+    never be mutated in place — they are shared).
+
+    Delegates to :mod:`fade_cache`, which memoizes one stamped copy per
+    (sprite, quantized alpha) instead of allocating a fresh copy per blit:
+    steady-state scenes like the lawn re-fade the same halos/auras/shadows
+    at nearly the same alpha every frame."""
+    return fade_cache.faded(surface, alpha)
+
+
+# Translucent-primitive scratch cache. The display surface has no per-pixel
+# alpha channel, so ``pygame.draw.rect(screen, (0, 0, 0, 180), ...)`` silently
+# draws a *solid black* rect — the alpha in the colour tuple is ignored. These
+# helpers route the draw through an SRCALPHA surface so the alpha is honoured.
+_alpha_cache = {}
+
+
+def _scratch(w, h):
+    w, h = max(1, int(w)), max(1, int(h))
+    s = _alpha_cache.get((w, h))
+    if s is None:
+        s = pygame.Surface((w, h), pygame.SRCALPHA)
+        _alpha_cache[(w, h)] = s
+    else:
+        s.fill((0, 0, 0, 0))
+    return s
+
+
+def alpha_rect(screen, color, rect, radius=0):
+    """Draw a translucent rounded rect without leaking into neighbouring px."""
+    x, y, w, h = rect
+    if w <= 0 or h <= 0:
+        return
+    s = _scratch(w, h)
+    pygame.draw.rect(s, color, (0, 0, w, h), border_radius=radius)
+    screen.blit(s, (int(x), int(y)))
 
 
 class FloatingText:
@@ -122,16 +154,24 @@ class WaveWarning:
         alpha = int(255 * fade_in * fade_out)
         bw = self._main.get_width() + 40
         bh = self._main.get_height() + 24
+        if self._sub is not None:
+            bh += self._sub.get_height() + 4
         bx = SCREEN_WIDTH // 2 - bw // 2
         by = 200
+        # Rounded, half-alpha strip. The old hard-edged (0,0,0,180) rect read
+        # as a black square dropped on the lawn in front of the entering
+        # zombies (用户报的"僵尸前头脚下的黑方块") — softer corners and a
+        # lighter wash make it read as a banner backdrop instead.
         backdrop = pygame.Surface((bw, bh), pygame.SRCALPHA)
-        backdrop.fill((0, 0, 0, int(180 * fade_in * fade_out)))
+        pygame.draw.rect(backdrop, (0, 0, 0, int(120 * fade_in * fade_out)),
+                         (0, 0, bw, bh), border_radius=18)
         screen.blit(backdrop, (bx, by))
         main = faded(self._main, alpha)
         screen.blit(main, (SCREEN_WIDTH // 2 - main.get_width() // 2, by + 12))
         if self._sub is not None:
             sub = faded(self._sub, alpha)
-            screen.blit(sub, (SCREEN_WIDTH // 2 - sub.get_width() // 2, by + bh + 8))
+            screen.blit(sub, (SCREEN_WIDTH // 2 - sub.get_width() // 2,
+                              by + 12 + self._main.get_height() + 6))
 
 
 # ---------------------------------------------------------------
