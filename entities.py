@@ -4,6 +4,7 @@ import pygame
 import math
 import random
 import assets_loader
+import fx
 from constants import *
 
 # ============================================================
@@ -91,34 +92,260 @@ class Projectile:
 # ============================================================
 # Sun
 # ============================================================
-class Sun:
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
-        self.target_y = y
-        self.falling = True
+class _Pickup:
+    """Shared life cycle for a sun / plant-food vial: fall, bounce, expire.
+
+    Both pickups used to run their own near-identical two-line physics
+    (``self.y += 60 * dt`` then ``self.alive = False``) in separate classes.
+    Lifting the motion into one base means the trajectories, the bounce feel
+    and the expiry warning stay in sync, and there is one place to tune them.
+
+    States, in order:
+
+    ``eject``   ballistic pop out of a sunflower (only for plant-produced sun)
+    ``fall``    gravity-accelerated descent with a terminal velocity + sway
+    ``bounce``  2-3 damped rebounds that actually move the body
+    ``rest``    settled on the lawn, gently bobbing
+    ``fading``  last ``EXPIRE_WARN_S`` seconds: blink, shrink, tilt out
+    ``collect`` fly into the jar / energy counter
+
+    Subclasses supply :meth:`_motion_done` and :meth:`_draw_body`.
+    """
+
+    # Tuning shared by sun and plant food. The fall is gravity driven but
+    # capped, so a sun dropped from the top of the screen takes about two
+    # seconds to reach the lawn — slow enough to click, fast enough to feel
+    # alive rather than floaty.
+    GRAVITY = 640.0
+    TERMINAL_VY = 215.0
+    SWAY_AMP = 13.0          # peak horizontal excursion, in px
+    SWAY_HZ = 0.85
+    EJECT_GRAVITY = 700.0
+    # 0.62 gives a first hop of ~14 px, then ~5, then ~2 — a visible decay
+    # that still reads as "landed" rather than "bouncing ball".
+    BOUNCE_RESTITUTION = 0.62
+    BOUNCE_COUNT = 3
+    EXPIRE_WARN_S = 3.0      # how long the fade-out warning lasts
+
+    def _init_motion(self, x, y):
+        self.x = float(x)
+        self.y = float(y)
+        self.vx = 0.0
+        self.vy = 0.0
+        self.phase = "fall"          # see the class docstring
         self.alive = True
-        self.collect_radius = 30
-        # Eject arc — when > 0, sun pops up before falling. Set by Sunflower.
-        self.eject_t = 0.0           # 0..0.4s eject duration
-        self.eject_vy = 0.0          # initial upward velocity (px/s)
-        self.eject_from_y = float(y)
-        self.angle = 0
-        self.wobble = random.uniform(-0.05, 0.05)
+        self.falling = True          # kept: gameplay code checks this
+        self.bounces_left = 0
+        self.squash = 0.0            # 0..1 impact squash, decays
+        self.alpha = 255
+        self.scale = 1.0
+        self.tilt = 0.0              # degrees, used by the fade-out
         self.age = 0.0
         self.settled_age = 0.0
-        # fly-to-jar collection (original PvZ feel)
+        self._sway_phase = 0.0
+        self._sway_x0 = self.x        # centre line the sway oscillates around
+        self._sway_dir = random.choice((-1.0, 1.0))
+        self._landed_pending = False  # drained by the game layer for FX
+
+    # ------------------------------------------------------------- motion
+    def _start_fall(self, target_y, speed=0.0):
+        self.target_y = float(target_y)
+        self.phase = "fall"
+        self.falling = True
+        self.vy = speed
+        # Re-anchor the sway from wherever the eject arc left off, and restart
+        # the phase at zero so the descent begins exactly on the centre line.
+        self._sway_x0 = self.x
+        self._sway_phase = 0.0
+
+    def _step_motion(self, dt):
+        """Advance one frame. Returns True when the caller should stop."""
+        self.age += dt
+        if self.squash > 0:
+            self.squash = max(0.0, self.squash - dt * 5.0)
+        if self.phase == "collect":
+            return self._step_collect(dt)
+
+        if self.phase == "eject":
+            self.vy += self.EJECT_GRAVITY * dt
+            self.x += self.vx * dt
+            self.y += self.vy * dt
+            # Once the pop has turned over and we are heading back down,
+            # hand off to the normal descent.
+            if self.vy > 0 and self.y >= self.target_y:
+                self._start_fall(self.target_y, self.vy)
+            return False
+
+        if self.phase == "fall":
+            self.vy = min(self.TERMINAL_VY, self.vy + self.GRAVITY * dt)
+            self.y += self.vy * dt
+            # Sway: a slow horizontal drift so sky suns don't fall down a
+            # ruler-straight line. Placed absolutely against the centre line
+            # rather than integrated — integrating a sinusoid as a velocity
+            # divides the amplitude by 2*pi*f, which made a 13 px setting
+            # drift a barely visible 2.4 px.
+            self._sway_phase += math.tau * self.SWAY_HZ * dt
+            self.x = (self._sway_x0
+                      + math.sin(self._sway_phase) * self.SWAY_AMP * self._sway_dir)
+            if self.y >= self.target_y:
+                self.y = self.target_y
+                self._on_land()
+            return False
+
+        if self.phase == "bounce":
+            self.vy += self.GRAVITY * dt
+            self.y += self.vy * dt
+            if self.y >= self.target_y:
+                self.y = self.target_y
+                self.bounces_left -= 1
+                if self.bounces_left <= 0:
+                    self.rest_y = self.target_y
+                    self.phase = "rest"
+                    self.settled_age = 0.0
+                    self.falling = False
+                    self.vy = 0.0
+                    # The final settle is still an impact — a soft squash so
+                    # the sun "thuds" to rest instead of snapping still
+                    # (审计发现：只有前几次落地有形变，最后一次没有).
+                    self.squash = 0.6
+                else:
+                    self.vy = -abs(self.vy) * self.BOUNCE_RESTITUTION
+                    self.squash = 1.0
+            return False
+
+        if self.phase == "rest":
+            self.settled_age += dt
+            if self.settled_age >= self.lifetime() - self.EXPIRE_WARN_S:
+                self.phase = "fading"
+            return False
+
+        if self.phase == "fading":
+            self.settled_age += dt
+            left = self.lifetime() - self.settled_age
+            t = max(0.0, min(1.0, left / self.EXPIRE_WARN_S))
+            # Blink faster as it runs out, shrink, and sag over.
+            blink = 0.55 + 0.45 * math.sin(self.settled_age * (10.0 + 26.0 * (1.0 - t)))
+            self.alpha = int(255 * t * (0.5 + 0.5 * blink))
+            self.scale = 0.55 + 0.45 * t
+            self.tilt = (1.0 - t) * 16.0
+            if left <= 0:
+                self.alive = False
+            return False
+        return False
+
+    def _on_land(self):
+        """First contact with the lawn: start the rebound and flag the game."""
+        # ``falling`` means "still in the air, not yet clickable" — the
+        # rebound happens *on* the lawn, so the pickup is already grabbable
+        # and the flag clears here rather than after the last bounce.
+        self.falling = False
+        if self.bounces_left > 0:
+            self.phase = "bounce"
+            self.vy = -abs(self.vy) * self.BOUNCE_RESTITUTION
+        else:
+            self.phase = "rest"
+            self.settled_age = 0.0
+            self.vy = 0.0
+        self.squash = 1.0
+        self._landed_pending = True
+
+    def _step_collect(self, dt):
+        self._ct += dt / self._cdur
+        t = min(1.0, self._ct)
+        self._motion_collect(t, dt)
+        if self._ct >= 1.0:
+            self.arrived = True
+            self.alive = False
+        return True
+
+    def _motion_collect(self, t, dt):
+        ease = t * t
+        self.x = self._cx0 + (self._ctarget[0] - self._cx0) * ease
+        self.y = self._cy0 + (self._ctarget[1] - self._cy0) * ease
+
+    # ------------------------------------------------------------- helpers
+    def lifetime(self):
+        raise NotImplementedError
+
+    def visible_rect(self):
+        r = 20
+        return pygame.Rect(self.x - r, self.y - r, r * 2, r * 2)
+
+    def rect(self):
+        r = SUN_COLLECT_RADIUS
+        cx, cy = self._visual_center()
+        return pygame.Rect(cx - r, cy - r, r * 2, r * 2)
+
+    def _visual_center(self):
+        """Where the sprite is actually drawn this frame.
+
+        ``rect`` has to be built around this, not around the raw physics
+        position — the resting bob is a draw-only offset, so a sun drawn 2 px
+        high used to have its click box 2 px low (阳光点击不跟手的来源之一).
+        """
+        return self.x, self.y
+
+    def contains(self, mx, my):
+        """Circular hit test matching the round sprite.
+
+        ``rect().collidepoint`` is a square: corners sit ~10 px outside the
+        visible disc and the top/bottom middles ~10 px inside it, so clicks
+        near the sun's edge failed while clicks on empty lawn beside it won.
+        """
+        if self.collected:
+            return False
+        cx, cy = self._visual_center()
+        r = SUN_COLLECT_RADIUS
+        return (mx - cx) ** 2 + (my - cy) ** 2 <= r * r
+
+
+class Sun(_Pickup):
+    """A sun: falls from the sky or pops out of a sunflower, then waits.
+
+    阳光出现轨迹 — a sunflower's sun leaves on a real ballistic arc (up, over,
+    down) rather than the old "nudge y by 30px and hand off", and a sky sun
+    drifts sideways as it falls so a row of them doesn't look like a sprite
+    sheet being scrolled.
+
+    反弹轨迹 — landing plays 3 damped rebounds that actually move the body,
+    with a squash on each impact, instead of a 6px sine offset that never
+    touched the ground.
+
+    消失机制 — an uncollected sun no longer pops out of existence. It blinks
+    and shrinks for the last three seconds, so an expiring sun reads as a
+    warning you can still act on.
+    """
+
+    def __init__(self, x, y):
+        self._init_motion(x, y)
+        self.target_y = float(y)
+        self.collect_radius = 30
+        self.angle = 0.0
+        self.amount = SUN_VALUE       # sunflowers at higher level give more
+        # Collect-flight state
         self.collected = False
         self.arrived = False
-        self.amount = SUN_VALUE  # sunflowers at higher level produce more
-        self._cx0 = 0.0
-        self._cy0 = 0.0
+        self._cx0 = self._cy0 = 0.0
         self._ctarget = (0.0, 0.0)
         self._ct = 0.0
         self._cdur = 0.3
-        # bounce animation when first touching the lawn
-        self.bounce_t = 1.0   # 1.0 = done; <1 = mid bounce
-        self._bounce_amp = 6  # vertical bounce amplitude in px
+        self.collect_scale = 1.0
+
+    def lifetime(self):
+        return SUN_LIFETIME / 1000.0
+
+    def eject(self, vy=-210.0, vx=None, target_y=None):
+        """Pop out of a sunflower head: an upward kick on a ballistic arc."""
+        self.phase = "eject"
+        self.vy = vy
+        self.vx = vx if vx is not None else random.uniform(-34.0, 34.0)
+        self.target_y = float(target_y if target_y is not None else self.y + 46)
+        self.falling = True
+
+    def drop_from_sky(self, target_y):
+        """Enter from above and accelerate down to ``target_y``."""
+        self.bounces_left = self.BOUNCE_COUNT
+        self._start_fall(target_y, speed=0.0)
 
     def collect(self, target):
         """Start the flight into the sun jar; game credits the sun on arrival."""
@@ -126,78 +353,72 @@ class Sun:
             return
         self.collected = True
         self.falling = False
+        self.phase = "collect"
+        # A sun clicked during its expiry blink must not keep fading while it
+        # flies to the jar — restore full opacity for the collect animation.
+        self.alpha = 255
         self._cx0, self._cy0 = self.x, self.y
         self._ctarget = (float(target[0]), float(target[1]))
         dist = math.hypot(self._ctarget[0] - self.x, self._ctarget[1] - self.y)
         self._cdur = max(0.22, min(0.5, dist / 2400.0))
         self._ct = 0.0
 
-    def update(self, dt, player_x=None, player_y=None):
-        self.age += dt
+    def _motion_collect(self, t, dt):
+        ease = t * t                       # accelerate into the jar
+        self.x = self._cx0 + (self._ctarget[0] - self._cx0) * ease
+        self.y = self._cy0 + (self._ctarget[1] - self._cy0) * ease
+        self.collect_scale = 1.0 - 0.35 * t
+
+    def update(self, dt, hovered=False):
         self.angle += 2.2 * dt
-        if self.collected:
-            self._ct += dt / self._cdur
-            t = min(1.0, self._ct)
-            ease = t * t  # accelerate into the jar
-            self.x = self._cx0 + (self._ctarget[0] - self._cx0) * ease
-            self.y = self._cy0 + (self._ctarget[1] - self._cy0) * ease
-            if self._ct >= 1.0:
-                self.arrived = True
-                self.alive = False
+        # Cursor parked on a sun suspends its motion: fall, rebound, resting
+        # bob and the expiry blink all hold their breath while the sun is
+        # hovered (阳光停在光标下), resuming the instant the cursor leaves.
+        # The spin keeps turning so it still reads as alive. The game passes
+        # ``hovered`` from its own per-frame hit test, so the freeze region
+        # is exactly the click/hover circle — no second geometry to drift.
+        if hovered and not self.collected:
             return
-        # Eject arc: short upward bounce when Sunflower produces a sun. The
-        # sun pops out of the flower head with a brief ~160 px/s upward kick
-        # before gravity (the falling phase) takes over. We delay the
-        # falling handoff by 1 frame so the sun visibly continues downward
-        # for a moment after the eject peak — without this, the very next
-        # frame finds the sun already "at" its target and snaps to settled.
-        if self.eject_t > 0:
-            self.eject_t = max(0.0, self.eject_t - dt)
-            self.y += self.eject_vy * dt
-            self.eject_vy += 480 * dt   # gravity pulls the eject back down
-            if self.eject_t <= 0:
-                # hand off to falling — set falling target 30px below where
-                # we are now so the falling phase actually has room to play.
-                self.target_y = self.y + 30
-                self.falling = True
-            return
-        if self.falling:
-            self.y += 60 * dt
-            if self.y >= self.target_y:
-                self.y = self.target_y
-                self.falling = False
-                self.settled_age = 0.0
-                self.bounce_t = 0.0   # start bounce right when we hit the lawn
-        else:
-            # Sun stays where it landed until the player clicks it.
-            self.settled_age += dt
-            if self.settled_age >= SUN_LIFETIME / 1000.0:
-                self.alive = False
-        # advance bounce (~0.45s total)
-        if self.bounce_t < 1.0:
-            self.bounce_t = min(1.0, self.bounce_t + dt / 0.45)
+        self._step_motion(dt)
         return 0
 
-    def draw(self, screen):
-        offset_x = math.sin(self.angle) * 3
-        # Bounce curve: dampened sin — peak at t=0.3, returns to 0 at t=1.0
-        if self.bounce_t < 1.0:
-            bounce_dy = -math.sin(self.bounce_t * math.pi) * self._bounce_amp * (1.0 - self.bounce_t)
-        else:
-            bounce_dy = 0.0
-        sun_img = assets_loader.rotated("ui_sun", 40, 40,
-                                        int((self.angle * 18) / 15))
-        if sun_img is not None:
-            # 24 cached rotation frames: stable and cheap even with many suns.
-            screen.blit(sun_img, sun_img.get_rect(center=(int(self.x + offset_x), int(self.y + bounce_dy))))
-        else:
-            pygame.draw.circle(screen, COLOR_YELLOW, (int(self.x + offset_x), int(self.y)), 18)
-            pygame.draw.circle(screen, COLOR_ORANGE, (int(self.x + offset_x), int(self.y)), 18, 2)
-            pygame.draw.circle(screen, COLOR_WHITE, (int(self.x + offset_x - 4), int(self.y - 4)), 4)
+    def _visual_center(self):
+        bob = math.sin(self.age * 2.4) * 2.0 if self.phase == "rest" else 0.0
+        return self.x, self.y + bob
 
-    def rect(self):
-        r = SUN_COLLECT_RADIUS
-        return pygame.Rect(self.x - r, self.y - r, r * 2, r * 2)
+    def draw(self, screen):
+        base = SUN_SPRITE_SIZE
+        # Spin the sprite at its natural size first, then deform. Doing it the
+        # other way round — scaling to (w, h) and *then* rotating, which is what
+        # assets_loader.rotated does internally — drags the squash axis around
+        # with the sprite: at a 90 degrees step the "wide and short" impact
+        # squash rendered tall and narrow. It also minted a fresh cache entry
+        # per distinct (w, h, step) triple, so the 0.2 s squash animation
+        # allocated ~15 throwaway surfaces every landing.
+        img = assets_loader.rotated("ui_sun", base, base, int((self.angle * 18) / 15))
+        # Single source of truth for the resting bob: the click/hover tests
+        # read the same _visual_center the sprite is drawn through.
+        cx, cy = (int(v) for v in self._visual_center())
+        if img is None:
+            pygame.draw.circle(screen, COLOR_YELLOW, (cx, cy), base // 2)
+            pygame.draw.circle(screen, COLOR_ORANGE, (cx, cy), base // 2, 2)
+            return
+        if self.tilt:
+            img = pygame.transform.rotate(img, self.tilt)
+        # Screen-space deformation: wide-and-short on impact, uniform shrink
+        # while flying into the jar.
+        if self.phase == "collect":
+            sx = sy = self.collect_scale
+        else:
+            sx = self.scale * (1.0 + 0.30 * self.squash)
+            sy = self.scale * (1.0 - 0.26 * self.squash)
+        if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
+            w = max(8, int(img.get_width() * sx))
+            h = max(8, int(img.get_height() * sy))
+            img = pygame.transform.smoothscale(img, (w, h))
+        if self.alpha < 255:
+            img = fx.faded(img, self.alpha)
+        screen.blit(img, img.get_rect(center=(cx, cy)))
 
 
 # ============================================================
@@ -206,24 +427,24 @@ class Sun:
 _food_glow_cache = {}
 
 
-class PlantFood:
-    """Falls from the sky like a sun; clicking stores it for feeding a plant."""
+class PlantFood(_Pickup):
+    """The 能量豆 vial: drops from the sky, then waits to be fed to a plant.
+
+    Shares the whole motion life cycle with :class:`Sun` — gravity-driven
+    fall, one heavy rebound on landing, and the same blink-and-shrink expiry
+    warning instead of vanishing mid-thought.
+    """
 
     def __init__(self, x, y):
-        self.x = x
-        self.y = y
-        self.target_y = y
-        self.falling = True
-        self.alive = True
-        self.age = 0.0
-        self.settled_age = 0.0
+        self._init_motion(x, y)
+        self.target_y = float(y)
+        self.bounces_left = 1        # a vial thuds rather than bounces
         # Fly-to-jar curve animation. Mirrors Sun.collect but uses an arc
         # (up-then-over parabola) and a rolling sprite rotation so the vial
         # visibly tumbles into the energy jar instead of teleporting.
         self.collected = False
         self.arrived = False
-        self._cx0 = 0.0
-        self._cy0 = 0.0
+        self._cx0 = self._cy0 = 0.0
         self._ctarget = (0.0, 0.0)
         self._ct = 0.0
         self._cdur = 0.5
@@ -238,6 +459,7 @@ class PlantFood:
             return False
         self.collected = True
         self.falling = False
+        self.phase = "collect"
         self._cx0, self._cy0 = self.x, self.y
         self._ctarget = (float(target[0]), float(target[1]))
         dist = math.hypot(self._ctarget[0] - self.x, self._ctarget[1] - self.y)
@@ -247,36 +469,30 @@ class PlantFood:
         self.collect_scale = 1.0
         return True
 
+    def lifetime(self):
+        return PLANT_FOOD_LIFETIME / 1000.0
+
+    def drop_from_sky(self, target_y):
+        """Enter from above and accelerate down to ``target_y``."""
+        self.bounces_left = 1
+        self._start_fall(target_y, speed=0.0)
+
+    def _motion_collect(self, t, dt):
+        # ease-in-out (smoother than t*t) — feels like a real toss
+        ease = t * t * (3.0 - 2.0 * t)
+        self.x = self._cx0 + (self._ctarget[0] - self._cx0) * ease
+        # Parabolic arc: peak height scales with horizontal distance.
+        peak = max(60.0, math.hypot(self._ctarget[0] - self._cx0,
+                                    self._ctarget[1] - self._cy0) * 0.25)
+        self.y = self._cy0 + (self._ctarget[1] - self._cy0) * ease \
+                 - peak * 4.0 * t * (1.0 - t)
+        # Roll the sprite so it visibly tumbles during flight.
+        self.collect_angle += 720.0 * dt
+        # Shrink toward the end so it "lands in" the jar.
+        self.collect_scale = 1.0 - 0.55 * t
+
     def update(self, dt):
-        self.age += dt
-        if self.collected:
-            self._ct += dt / self._cdur
-            t = min(1.0, self._ct)
-            # ease-in-out (smoother than t*t) — feels like a real toss
-            ease = t * t * (3.0 - 2.0 * t)
-            self.x = self._cx0 + (self._ctarget[0] - self._cx0) * ease
-            # Parabolic arc: peak height scales with horizontal distance.
-            peak = max(60.0, math.hypot(self._ctarget[0] - self._cx0,
-                                        self._ctarget[1] - self._cy0) * 0.25)
-            self.y = self._cy0 + (self._ctarget[1] - self._cy0) * ease \
-                     - peak * 4.0 * t * (1.0 - t)
-            # Roll the sprite so it visibly tumbles during flight.
-            self.collect_angle += 720.0 * dt
-            # Shrink toward the end so it "lands in" the jar.
-            self.collect_scale = 1.0 - 0.55 * t
-            if self._ct >= 1.0:
-                self.arrived = True
-                self.alive = False
-            return
-        if self.falling:
-            self.y += 55 * dt
-            if self.y >= self.target_y:
-                self.y = self.target_y
-                self.falling = False
-        else:
-            self.settled_age += dt
-            if self.settled_age >= PLANT_FOOD_LIFETIME / 1000.0:
-                self.alive = False
+        self._step_motion(dt)
 
     def draw(self, screen):
         if self.collected:
@@ -317,7 +533,8 @@ class PlantFood:
             for r, a in ((30, 40), (24, 60), (18, 80)):
                 pygame.draw.circle(glow, (120, 255, 120, a), (32, 32), r)
             _food_glow_cache["glow"] = glow
-        glow.set_alpha(int(140 + 90 * math.sin(self.age * 5)))
+        # fx.faded copies before stamping — the glow surface is a shared cache
+        glow = fx.faded(glow, int(140 + 90 * math.sin(self.age * 5)))
         screen.blit(glow, glow.get_rect(center=(int(self.x), int(self.y))))
         r = int(13 * pulse)
         pygame.draw.circle(screen, (80, 200, 60), (int(self.x), int(self.y)), r)
@@ -351,6 +568,62 @@ def _draw_hp_bar(screen, x, y, w, ratio, fill_color=COLOR_BAR_FILL):
     pygame.draw.rect(screen, fill_color, (x, y, int(bw * max(0.0, min(1.0, ratio))), bh))
 
 
+_CRACK_R = 64                      # half-size of the cached crack overlay
+_crack_cache = {}
+
+
+def _crack_sprite(n_cracks, seed, shade):
+    """Crack overlay pre-rendered around a local centre of (R, R).
+
+    The cracks were re-rolled every frame from a seeded RNG — around 20
+    ``pygame.draw.line`` calls plus a fresh ``random.Random`` per wallnut per
+    frame, for a pattern that only changes when the plant takes damage. The
+    seed is derived from the plant's position, and plants sit on fixed grid
+    cells, so the key space is small and naturally bounded.
+    """
+    key = (n_cracks, seed, shade)
+    hit = _crack_cache.get(key)
+    if hit is not None:
+        return hit
+    r, img = _CRACK_R, pygame.Surface((_CRACK_R * 2, _CRACK_R * 2), pygame.SRCALPHA)
+    rng = random.Random(seed)          # deterministic per plant
+    color = (shade, shade // 2, shade // 3)
+    for _ in range(n_cracks):
+        # random bite anchor on the wallnut body
+        bx = r + rng.randint(-22, 22)
+        by = r + rng.randint(-22, 22)
+        # zig-zag crack with 3-5 segments
+        n_segs = rng.randint(3, 5)
+        pts = [(bx, by)]
+        for _s in range(n_segs):
+            last = pts[-1]
+            # each segment drifts away from bite and varies direction
+            pts.append((last[0] + rng.randint(-7, 7),
+                        last[1] + rng.randint(-9, 9)))
+        for i in range(len(pts) - 1):
+            pygame.draw.line(img, color, pts[i], pts[i + 1], 2)
+    _crack_cache[key] = img
+    return img
+
+
+def _draw_plant_hp(screen, plant, bw=40):
+    """Health bar for a plant — hidden until it has actually been chewed.
+
+    Matches what :meth:`Zombie._draw_hp` already does, and for the same
+    reason: a gauge over every healthy plant is visual noise. It is also the
+    single busiest primitive in the frame — a full lawn is ~28 plants, and
+    drawing each one unconditionally cost 56 ``pygame.draw.rect`` calls every
+    frame to render something the player has no reason to read.
+
+    Every plant class used to carry its own byte-identical copy of this; they
+    now share this one.
+    """
+    if plant.hp >= plant.max_hp:
+        return
+    ratio = max(0.0, min(1.0, plant.hp / float(plant.max_hp)))
+    _draw_hp_bar(screen, plant.x + 10, plant.y - 8, bw, ratio)
+
+
 def apply_plant_level(plant, level):
     """Scale a plant's stats to its upgrade level (1..PLANT_LEVEL_MAX).
 
@@ -371,6 +644,8 @@ def apply_plant_level(plant, level):
             plant.max_hp = new_max
     if "radius" in stats:
         plant.blast_radius = stats["radius"][lvl]
+    if "bomb_radius" in stats:
+        plant.bomb_radius = stats["bomb_radius"][lvl]
 
 
 def level_pips(plant):
@@ -455,13 +730,7 @@ class Peashooter:
         self._draw_hp(screen)
 
     def _draw_hp(self, screen):
-        bw = 40
-        bh = 4
-        bx = self.x + 10
-        by = self.y - 8
-        pygame.draw.rect(screen, COLOR_BAR_BG, (bx, by, bw, bh))
-        fill_w = int(bw * (self.hp / self.max_hp))
-        pygame.draw.rect(screen, COLOR_BAR_FILL, (bx, by, fill_w, bh))
+        _draw_plant_hp(screen, self)
 
     def rect(self):
         return pygame.Rect(self.x, self.y, self.w, self.h)
@@ -560,13 +829,7 @@ class SnowPea:
         self._draw_hp(screen)
 
     def _draw_hp(self, screen):
-        bw = 40
-        bh = 4
-        bx = self.x + 10
-        by = self.y - 8
-        pygame.draw.rect(screen, COLOR_BAR_BG, (bx, by, bw, bh))
-        fill_w = int(bw * (self.hp / self.max_hp))
-        pygame.draw.rect(screen, COLOR_BAR_FILL, (bx, by, fill_w, bh))
+        _draw_plant_hp(screen, self)
 
     def rect(self):
         return pygame.Rect(self.x, self.y, self.w, self.h)
@@ -634,7 +897,11 @@ class CobCannon:
         # start position: top of plant
         sx = self.x + self.w // 2
         sy = self.y + 8
-        proj = KernelBomb(sx, sy, target_x, target_y)
+        # Level upgrades (apply_plant_level) scale the payload; unsprinkled
+        # cannons fall back to the level-1 defaults.
+        proj = KernelBomb(sx, sy, target_x, target_y,
+                         damage=getattr(self, "damage", 1800),
+                         radius=getattr(self, "bomb_radius", 110))
         return proj
 
     def draw(self, screen):
@@ -682,13 +949,7 @@ class CobCannon:
         self._draw_hp(screen)
 
     def _draw_hp(self, screen):
-        bw = 50
-        bh = 4
-        bx = self.x + 10
-        by = self.y - 8
-        pygame.draw.rect(screen, COLOR_BAR_BG, (bx, by, bw, bh))
-        fill_w = int(bw * (self.hp / self.max_hp))
-        pygame.draw.rect(screen, COLOR_BAR_FILL, (bx, by, fill_w, bh))
+        _draw_plant_hp(screen, self, bw=50)      # wide body, wide gauge
 
     def rect(self):
         return pygame.Rect(self.x, self.y, self.w, self.h)
@@ -815,12 +1076,10 @@ class Sunflower:
             self.glow_timer = 0.6
             sun = Sun(self.x + 30, self.y - 20)
             sun.amount = self.sun_amount
-            # Eject arc: pop the sun up briefly so it visibly leaves the
-            # flower head instead of appearing out of thin air.
-            sun.falling = False
-            sun.eject_t = 0.40
-            sun.eject_vy = -160.0
-            sun.eject_from_y = sun.y
+            # Eject arc: pop the sun out of the flower head on a real
+            # ballistic arc so it visibly leaves the plant rather than
+            # appearing on the lawn out of thin air.
+            sun.eject(vy=-195.0, target_y=self.y + random.randint(30, 62))
             return sun
 
     def draw(self, screen):
@@ -837,8 +1096,7 @@ class Sunflower:
         if self.glow_timer > 0:
             halo = _halo_surface()
             strength = int(70 + 70 * min(1.0, self.glow_timer / 0.6))
-            halo.set_alpha(strength)
-            screen.blit(halo, (self.x + 4 + dx, self.y + 4 - dy))
+            screen.blit(fx.faded(halo, strength), (self.x + 4 + dx, self.y + 4 - dy))
         if frame is not None:
             screen.blit(frame, (self.x + dx, self.y - dy))
         else:
@@ -851,13 +1109,7 @@ class Sunflower:
         self._draw_hp(screen)
 
     def _draw_hp(self, screen):
-        bw = 40
-        bh = 4
-        bx = self.x + 10
-        by = self.y - 8
-        pygame.draw.rect(screen, COLOR_BAR_BG, (bx, by, bw, bh))
-        fill_w = int(bw * (self.hp / self.max_hp))
-        pygame.draw.rect(screen, COLOR_BAR_FILL, (bx, by, fill_w, bh))
+        _draw_plant_hp(screen, self)
 
     def rect(self):
         return pygame.Rect(self.x, self.y, self.w, self.h)
@@ -907,28 +1159,18 @@ class Wallnut:
         damage = 1.0 - (self.hp / self.max_hp)   # 0..1 as wallnut is chewed
         if damage <= 0.05:
             return  # pristine — no cracks yet
-        n_cracks = int(1 + damage * 5)           # 1..6 cracks
+        n_cracks = min(6, int(1 + damage * 5))   # 1..6 cracks
+        # Darker shade as the wallnut gets chewed, quantised onto the same
+        # ladder as the crack count so the sprite cache stays small: the shade
+        # is now a step function of the damage tier rather than of continuous
+        # HP, which also keeps a crack looking consistent as it deepens.
+        tier = n_cracks - 1                      # 0..5
+        shade = 50 + int(60 * tier / 5.0)
+        img = _crack_sprite(n_cracks, int(self.x) * 31 + int(self.y), shade)
         # center of the visible sprite (relative to the sprite box)
         cx = self.x + self.w // 2
         cy = self.y + self.h // 2 - 4
-        rng = random.Random(int(self.x) * 31 + int(self.y))  # deterministic per plant
-        for _ in range(n_cracks):
-            # random bite anchor on the wallnut body
-            bx = cx + rng.randint(-22, 22)
-            by = cy + rng.randint(-22, 22)
-            # zig-zag crack with 3-5 segments
-            n_segs = rng.randint(3, 5)
-            pts = [(bx, by)]
-            for s in range(n_segs):
-                last = pts[-1]
-                # each segment drifts away from bite and varies direction
-                pts.append((last[0] + rng.randint(-7, 7),
-                            last[1] + rng.randint(-9, 9)))
-            # darker shade as wallnut gets chewed
-            shade = 50 + int(60 * damage)
-            color = (shade, shade // 2, shade // 3)
-            for i in range(len(pts) - 1):
-                pygame.draw.line(screen, color, pts[i], pts[i + 1], 2)
+        screen.blit(img, (cx - _CRACK_R, cy - _CRACK_R))
 
     def draw(self, screen):
         prefix = self._crack_state()
@@ -952,13 +1194,7 @@ class Wallnut:
         self._draw_hp(screen)
 
     def _draw_hp(self, screen):
-        bw = 40
-        bh = 4
-        bx = self.x + 10
-        by = self.y - 8
-        pygame.draw.rect(screen, COLOR_BAR_BG, (bx, by, bw, bh))
-        fill_w = int(bw * (self.hp / self.max_hp))
-        pygame.draw.rect(screen, COLOR_BAR_FILL, (bx, by, fill_w, bh))
+        _draw_plant_hp(screen, self)
 
     def rect(self):
         return pygame.Rect(self.x, self.y, self.w, self.h)
@@ -1090,13 +1326,7 @@ class CherryBomb:
         self._draw_hp(screen)
 
     def _draw_hp(self, screen):
-        bw = 40
-        bh = 4
-        bx = self.x + 10
-        by = self.y - 8
-        pygame.draw.rect(screen, COLOR_BAR_BG, (bx, by, bw, bh))
-        fill_w = int(bw * (self.hp / self.max_hp))
-        pygame.draw.rect(screen, COLOR_BAR_FILL, (bx, by, fill_w, bh))
+        _draw_plant_hp(screen, self)
 
     def rect(self):
         return pygame.Rect(self.x, self.y, self.w, self.h)
@@ -1164,13 +1394,7 @@ class Fumeshroom:
         self._draw_hp(screen)
 
     def _draw_hp(self, screen):
-        bw = 40
-        bh = 4
-        bx = self.x + 10
-        by = self.y - 8
-        pygame.draw.rect(screen, COLOR_BAR_BG, (bx, by, bw, bh))
-        fill_w = int(bw * (self.hp / self.max_hp))
-        pygame.draw.rect(screen, COLOR_BAR_FILL, (bx, by, fill_w, bh))
+        _draw_plant_hp(screen, self)
 
     def rect(self):
         return pygame.Rect(self.x, self.y, self.w, self.h)
@@ -1439,20 +1663,120 @@ class Lawnmower:
         if self.activated:
             img = _dust_sprite()
             for i in range(4):
-                img.set_alpha(90 - i * 20)
-                screen.blit(img, (int(self.x) - 16 * (i + 1), self.y + 14))
+                # _dust_sprite is a shared cache — fx.faded copies per blit
+                screen.blit(fx.faded(img, 90 - i * 20),
+                            (int(self.x) - 16 * (i + 1), self.y + 14))
 
     def rect(self):
         return pygame.Rect(self.x, self.y, self.w, self.h)
 
 
 # ============================================================
+# Shared effect sprites (built once, blitted many times)
+# ============================================================
+_aura_cache = {}
+
+
+def _rally_aura():
+    """Soft red ring drawn around a zombie that a commander has rallied."""
+    img = _aura_cache.get("rally")
+    if img is None:
+        r = 56
+        img = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+        for i, (rr, a) in enumerate(((r, 22), (int(r * 0.82), 30),
+                                     (int(r * 0.62), 34))):
+            pygame.draw.circle(img, (255, 90, 60, a), (r, r), rr, 3)
+        pygame.draw.circle(img, (255, 180, 120, 60), (r, r), int(r * 0.45), 2)
+        _aura_cache["rally"] = img
+    return img
+
+
+def _burrow_mound():
+    """Churned-earth mound a digger leaves behind while underground."""
+    img = _aura_cache.get("burrow")
+    if img is None:
+        w, h = 54, 26
+        img = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.ellipse(img, (86, 62, 34), (0, 6, w, h - 6))
+        pygame.draw.ellipse(img, (118, 88, 48), (4, 2, w - 12, h - 8))
+        pygame.draw.ellipse(img, (146, 112, 62), (10, 0, w - 26, h - 12))
+        for i, (dx, dy, rr) in enumerate(((6, 12, 3), (16, 8, 2), (30, 14, 3),
+                                          (42, 10, 2), (24, 16, 2))):
+            pygame.draw.circle(img, (108, 80, 44), (dx, dy), rr)
+        _aura_cache["burrow"] = img
+    return img
+
+
+_ring_cache = {}
+
+
+def _get_ring_sprite(radius, color, alpha):
+    """Cached two-tone ring, quantized to 4 px so the cache stays small."""
+    radius = max(3, int(radius))
+    q = (radius // 4) * 4
+    key = (q, color, alpha // 24)
+    img = _ring_cache.get(key)
+    if img is not None:
+        return img
+    img = pygame.Surface((q * 2, q * 2), pygame.SRCALPHA)
+    pygame.draw.circle(img, (*color, alpha), (q, q), q, 3)
+    pygame.draw.circle(img, (255, 255, 255, int(alpha * 0.6)), (q, q), q // 2, 2)
+    _ring_cache[key] = img
+    return img
+
+
+# Elite skin for the AI variants. Every non-boss zombie draws from one shared
+# walk sheet, so without this a tactician and a basic zombie are the same
+# silhouette with different accessories. Each entry is (rgb, overlay alpha):
+# strong enough to name the variant, light enough to keep the shading.
+_AI_TINT = {
+    ZOMBIE_TACTICIAN: ((158, 132, 240), 255),   # violet
+    ZOMBIE_DIGGER:    ((226, 188, 132), 255),   # dust / khaki
+    ZOMBIE_HEALER:    ((132, 228, 192), 255),   # apothecary mint
+    ZOMBIE_COMMANDER: ((246, 146, 146), 255),   # officer crimson
+}
+# Public view of the same table, for the level preloader (game._preload_...).
+AI_ZOMBIE_TINTS = tuple(_AI_TINT.values())
+
+# On-screen body height every zombie sheet is scaled to. Module level so the
+# preloader warms the exact cache key the draw path will ask for.
+ZOMBIE_BODY_H = 96
+
+# Edge length the sun sprite is drawn at before its impact squash. Same reason
+# as ZOMBIE_BODY_H: the preloader has to warm the identical rotation key.
+SUN_SPRITE_SIZE = 40
+
+
+# ============================================================
 # Zombies
 # ============================================================
 class Zombie:
+    """A single zombie, from a shambling basic to the lane-reading tactician.
+
+    Animation is *distance driven* for the walk cycle (``walk_phase`` advances
+    with the pixels actually travelled), so the feet stay planted at any speed
+    and a frozen zombie visibly trudges instead of moonwalking. Eating and
+    dying keep their own clocks so switching state never snaps the sprite.
+    """
+
+    _FRAMES = 7          # cells per bundled zombie strip
+    STRIDE_PX = 30.0     # px of travel per full walk cycle
+    EAT_FPS = 7.0
+    EAT_BITE_S = 1.0     # one bite per this many seconds (matches the old rate)
+    # Shorter-limbed / quicker variants use a tighter stride so the feet do
+    # not appear to skate; a longer stride reads as a loping commander.
+    _STRIDE_BY_TYPE = {
+        ZOMBIE_TACTICIAN: 26.0,
+        ZOMBIE_DIGGER: 24.0,
+        ZOMBIE_HEALER: 32.0,
+        ZOMBIE_COMMANDER: 36.0,
+        ZOMBIE_FLAG: 27.0,
+        ZOMBIE_POLE: 28.0,
+    }
+
     def __init__(self, x, y, row, zombie_type=ZOMBIE_BASIC):
-        self.x = x
-        self.y = y
+        self.x = float(x)
+        self.y = float(y)
         self.row = row
         self.zombie_type = zombie_type
         info = ZOMBIE_INFO[zombie_type]
@@ -1461,28 +1785,33 @@ class Zombie:
         self.base_speed = info["speed"]
         self.speed = info["speed"]
         self.reward = info["reward"]
-        self.w = 90   # sprite frame is 60 wide; doubled to look big
-        self.h = 116  # sprite frame is 58 tall; doubled
+        self.w = 90   # logical box; the drawn body is ~55x96 anchored on the foot
+        self.h = 116
         self.alive = True
         self.eaten_plant = None
         self.eat_timer = 0
-        self.shake = 0
         self.hit_flash = 0
         self.reached_house = False
         self.reached_lawnmower = False
         self.anim_time = 0
         self.is_eating = False
         self.dying_timer = 0
-        # zombie's intrinsic offset for walking (offset within frame)
-        self.walk_offset = 0
+        # --- animation clocks (see class docstring) ---
+        self.walk_phase = random.random()
+        self.eat_clock = 0.0
+        self.die_clock = 0.0
         self._step_just_done = False
+        # --- status effects ---
         # Frozen state (e.g. Snow Pea, Winter Melon). ice_timer > 0 means
-        # zombie is slow + covered in ice crackles. Crackle overlay is drawn
-        # on top of the zombie sprite by Zombie.draw.
+        # zombie is slow + covered in ice crackles.
         self.ice_timer = 0.0
         self.ice_max = 0.0
         self.ice_crackles = []  # list of (x_offset, y_offset, age, max_age)
-        self.use_b_sheet = random.random() < 0.5  # alternate between two zombie sprites for variety
+        # Commander rally: multiplies speed / bite damage while > 0.
+        self.rally_timer = 0.0
+        self.rally_speed = 1.0
+        self.rally_dmg = 1.0
+        self.use_b_sheet = random.random() < 0.5  # two walk sheets for variety
         self.is_boss = (zombie_type == ZOMBIE_BOSS)
         self.in_wave = True  # counts toward the current wave (boss minions don't)
         self.death_counted = False
@@ -1515,12 +1844,48 @@ class Zombie:
         if self.is_bungee:
             self.y = -250  # starts above the canvas, descends in update()
 
+        # ---- AI zombies (see ai.py) ----
+        self.is_tactician = (zombie_type == ZOMBIE_TACTICIAN)
+        self.is_digger = (zombie_type == ZOMBIE_DIGGER)
+        self.is_healer = (zombie_type == ZOMBIE_HEALER)
+        self.is_commander = (zombie_type == ZOMBIE_COMMANDER)
+        self.is_smart = self.is_tactician or self.is_digger or self.is_healer \
+            or self.is_commander
+        # Elite skin: every non-boss zombie shares one walk sheet, so a colour
+        # wash is what makes an AI variant readable at a glance. (tint, alpha).
+        self.body_tint = _AI_TINT.get(zombie_type)
+        # Tactician: lane hop state
+        self.transfer_timer = random.uniform(1.5, TACTICIAN_TRANSFER_S)
+        self.transfer_t = 0.0
+        self._transfer_from_y = 0.0
+        self._transfer_to_y = 0.0
+        # Digger: burrow → tunnel → surface
+        self.dig_phase = None          # None | "burrow" | "under" | "emerge"
+        self.dig_t = 0.0
+        self._dig_remaining = 0.0      # px still to tunnel
+        self.underground = False
+        # Healer / commander action clocks
+        self.action_timer = random.uniform(0.6, 1.6)
+        # --- FX intents, drained once per frame by Game._consume_zombie_ai_fx.
+        # The entity records *what happened*; the game layer decides how it
+        # looks. Nothing here touches pygame draw calls.
+        self._beam_pending = None      # (target, "heal"|"rally")
+        self._hop_pending = None       # (x, y_from, y_to) tactician lane hop
+        self._dig_dust_pending = False # digger kicked up dirt
+        self._emerge_pending = False   # digger broke the surface
+        # Draw-time scratch (set every frame by draw(), read by the game layer)
+        self._vx = self._vy = 0
+        self._bcx = self._btop = 0
+        self._bw = self._bh = 0
+        self._hit_rect = pygame.Rect(0, 0, 58, 98)   # reused by rect()
+        self.STRIDE_PX = self._STRIDE_BY_TYPE.get(zombie_type, self.STRIDE_PX)
+
         if self.is_boss:
             self.w = 170
             self.h = 210
             self.use_b_sheet = False
 
-    def update(self, dt, plants):
+    def update(self, dt, plants, zombies=None):
         # ---- Boss-spawned minion sky-drop animation ----
         # The minion falls from sky to its lawn position; game.py listens for
         # the landing moment via the `_minion_drop_landed` flag to spawn a
@@ -1541,8 +1906,16 @@ class Zombie:
         if self.hit_flash > 0:
             self.hit_flash -= dt
         self.anim_time += dt
+        if self.rally_timer > 0:
+            self.rally_timer -= dt
+            if self.rally_timer <= 0:
+                self.rally_speed = 1.0
+                self.rally_dmg = 1.0
         if self.dying_timer > 0:
             self.dying_timer -= dt
+            # Death animation is a one-shot: play the 7-cell strip once across
+            # the (1 s) dying window and hold the last frame.
+            self.die_clock += dt
             if self.dying_timer <= 0:
                 self.alive = False
             return
@@ -1568,6 +1941,24 @@ class Zombie:
                 self.ice_crackles.clear()
         if self.is_bungee:
             return self._update_bungee(dt, plants)
+
+        # ---- Digger: burrow / tunnel / surface state machine ----
+        # Runs before the normal walk so the digger never has to path around
+        # the plants it is explicitly built to bypass.
+        if self.is_digger and self.dig_phase is not None:
+            return self._update_digger(dt)
+
+        # ---- Support AI: healers mend, commanders rally ----
+        if self.is_healer or self.is_commander:
+            self.action_timer -= dt
+            if self.action_timer <= 0:
+                if self.is_commander:
+                    self.action_timer = COMMANDER_PULSE_S
+                    self._rally_allies(zombies)
+                else:
+                    self.action_timer = HEALER_INTERVAL
+                    self._heal_ally(zombies)
+
         # find the first blocking plant in this row. Plants on a lily pad are
         # eaten before the lily pad itself; lily pads use a narrow hitbox so
         # the plant body is what the zombie first runs into.
@@ -1619,39 +2010,189 @@ class Zombie:
                 self.summon_timer = max(3.5, 7.0 - self.anim_time * 0.02)
                 return self._spawn_minion()
 
-        if blocking_plant and not self.floating:
+        # ---- Tactician: pick a softer lane and hop sideways into it ----
+        if self.is_tactician:
+            if self.transfer_t > 0:
+                self.transfer_t = max(0.0, self.transfer_t - dt)
+                t = 1.0 - self.transfer_t / TACTICIAN_TRANSFER_T
+                ease = t * t * (3.0 - 2.0 * t)
+                self.y = (self._transfer_from_y
+                          + (self._transfer_to_y - self._transfer_from_y) * ease
+                          - math.sin(t * math.pi) * 26.0)
+            else:
+                self.transfer_timer -= dt
+                if self.transfer_timer <= 0:
+                    self.transfer_timer = TACTICIAN_TRANSFER_S
+                    self._try_lane_transfer()
+
+        if blocking_plant and not self.floating and not self.underground:
+            if not self.is_eating:
+                # Restart the chew cycle from frame 0 — eat_clock only ever
+                # grew, so a zombie that stopped and resumed eating would
+                # start mid-animation with a stale frame offset.
+                self.eat_clock = 0.0
             self.is_eating = True
-            self.eat_timer += dt
-            if self.eat_timer > 1.0:
-                blocking_plant.take_damage(self.eat_damage)
+            self.eat_clock += dt
+            phase = self.freeze_factor()
+            self.eat_timer += dt * phase
+            if self.eat_timer > self.EAT_BITE_S:
+                blocking_plant.take_damage(self.eat_damage * self.rally_dmg)
                 self.eat_timer = 0
         elif self.reached_house:
             # zombie is at the door, eating it — no longer walks
+            if not self.is_eating:
+                self.eat_clock = 0.0
             self.is_eating = True
+            self.eat_clock += dt
             self.eat_timer += dt
-            if self.eat_timer > 1.0:
+            if self.eat_timer > self.EAT_BITE_S:
                 self.eat_timer = 0
                 # house HP is drained by game loop when a zombie has reached the door;
                 # here we just keep the zombie planted at the door frame
         else:
             self.is_eating = False
             self.eat_timer = 0
-            # Frozen zombies walk at half speed (and the slow lingers for ~half
-            # the remaining ice time so they "thaw" smoothly).
-            move_dt = dt * (0.5 if self.ice_timer > self.ice_max * 0.4 else 0.7)
-            self.x -= self.speed * move_dt
-            self.walk_offset = (self.walk_offset + 4 * move_dt) % 1.0
-            # Emit a "step taken" signal every full step cycle (0→1→0).
-            # Game layer reads this to drop a faint grass-print ellipse.
-            self._step_just_done = True
+            # Frozen zombies walk slower (and the slow eases off in the last
+            # stretch so they visibly "thaw" instead of snapping back).
+            move_dt = dt * self.freeze_factor()
+            dist = self.speed * self.rally_speed * move_dt
+            self.x -= dist
+            # Distance-driven walk cycle: feet stay planted at any speed, and
+            # a slowed zombie visibly trudges rather than sliding.
+            previous_phase = self.walk_phase
+            self.walk_phase = (self.walk_phase + dist / self.STRIDE_PX) % 1.0
+            self._step_just_done = self.walk_phase < previous_phase
+            # Digger: start tunnelling as it reaches the front line.
+            if self.is_digger and self.dig_phase is None:
+                self._maybe_start_dig()
             # zombies walk past the lawnmower slot; the lawnmower trigger is
             # handled in game.py (mower may already have been used)
             # Entering the house is based on the visible/combat body's left edge,
             # matching mower collision and eliminating the old 7px dead zone.
-            if self.rect().left < HOUSE_LEFT_WALL:
-                self.x += HOUSE_LEFT_WALL - self.rect().left
+            r = self.rect()
+            if r.left < HOUSE_LEFT_WALL:
+                self.x += HOUSE_LEFT_WALL - r.left
                 self.reached_house = True
         return None
+
+    # ------------------------------------------------------------ AI brains
+    def freeze_factor(self):
+        """Motion scale from the ice slow: 1.0 thawed, 0.5 deeply frozen."""
+        if self.ice_timer <= 0:
+            return 1.0
+        return 0.5 if self.ice_timer > self.ice_max * 0.4 else 0.7
+
+    def _try_lane_transfer(self):
+        """Hop to a softer row if one is worth the trip (tactician brain)."""
+        import ai
+        it = ai.intel
+        if not it.row_threat or self.underground or self.reached_house:
+            return
+        # Never abandon a lane we are actively chewing through.
+        if self.eaten_plant is not None:
+            return
+        target = it.best_transfer(self.row)
+        if target is None or target == self.row:
+            return
+        self._transfer_from_y = self.y
+        self._transfer_to_y = float(self.grid_y + target * CELL_H + 15)
+        self.transfer_t = TACTICIAN_TRANSFER_T
+        self.row = target
+        self.is_eating = False
+        self.eat_timer = 0
+        # FX hook for the game layer (dashed arc + landing ring).
+        self._hop_pending = (self.x, self.y, self._transfer_to_y)
+
+    def _maybe_start_dig(self):
+        """Begin burrowing once the front line is close, or after a while."""
+        import ai
+        if self.x > GRID_X + GRID_W:
+            return
+        front = ai.intel.row_front_x[self.row]
+        near_front = front < SCREEN_WIDTH and self.x <= front + CELL_W * 0.5
+        # Nothing in the lane: still tunnel a fixed distance so the digger
+        # crosses open ground fast and arrives as a surprise.
+        open_ground = front >= SCREEN_WIDTH and self.x < GRID_X + GRID_W * 0.62
+        if not (near_front or open_ground):
+            return
+        self.dig_phase = "burrow"
+        self.dig_t = 0.0
+        if front < SCREEN_WIDTH:
+            self._dig_target_x = max(GRID_X + 6.0, front - CELL_W * 0.85)
+        else:
+            self._dig_target_x = max(GRID_X + 6.0, self.x - DIGGER_MIN_TUNNEL)
+
+    def _update_digger(self, dt):
+        """0.55 s sink → fast underground travel → 0.55 s surface."""
+        half = DIGGER_BURROW_S * 0.5
+        self.dig_t += dt
+        if self.dig_phase == "burrow":
+            if self.dig_t >= half:
+                self.underground = True
+            if self.dig_t >= DIGGER_BURROW_S:
+                self.dig_phase = "under"
+                self.dig_t = 0.0
+                self._dig_dust_pending = True
+        elif self.dig_phase == "under":
+            step = self.speed * self.rally_speed * DIGGER_SPEED_MULT * dt
+            self.x -= step
+            self.walk_phase = (self.walk_phase + step / self.STRIDE_PX) % 1.0
+            # Turn up some dirt while tunnelling (game layer spawns the puff).
+            self._dig_dust_timer = getattr(self, "_dig_dust_timer", 0.0) + dt
+            if self._dig_dust_timer >= 0.05:
+                self._dig_dust_timer = 0.0
+                self._dig_dust_pending = True
+            if self.x <= self._dig_target_x:
+                self.x = self._dig_target_x
+                self.dig_phase = "emerge"
+                self.dig_t = 0.0
+                self._emerge_pending = True
+        else:  # emerge
+            if self.dig_t >= half:
+                self.underground = False
+            if self.dig_t >= DIGGER_BURROW_S:
+                self.dig_phase = None
+                self.dig_t = 0.0
+                self.underground = False
+        return None
+
+    def _heal_ally(self, zombies):
+        """Mend the worst-hurt zombie in range (healer brain)."""
+        if not zombies:
+            return
+        best, best_ratio = None, 1.0
+        for z in zombies:
+            if z is self or not z.alive or z.dying_timer > 0 or z.hp <= 0:
+                continue
+            if z.underground:
+                continue
+            if abs(z.x - self.x) > HEALER_RANGE or abs(z.row - self.row) > 1:
+                continue
+            ratio = z.hp / float(z.max_hp)
+            if ratio < best_ratio:
+                best, best_ratio = z, ratio
+        if best is None or best_ratio >= 0.995:
+            return
+        best.hp = min(best.max_hp, best.hp + HEALER_AMOUNT)
+        best.hit_flash = 0.0
+        self._beam_pending = (best, "heal")
+
+    def _rally_allies(self, zombies):
+        """Buff every zombie in range: +speed, +bite damage (commander brain)."""
+        if not zombies:
+            return
+        n = 0
+        for z in zombies:
+            if not z.alive or z.dying_timer > 0 or z.hp <= 0:
+                continue
+            if abs(z.x - self.x) > COMMANDER_RANGE or abs(z.row - self.row) > 2:
+                continue
+            z.rally_timer = COMMANDER_PULSE_S * 0.7
+            z.rally_speed = COMMANDER_SPEED_BUFF
+            z.rally_dmg = COMMANDER_DMG_BUFF
+            n += 1
+        if n:
+            self._beam_pending = (None, "rally")
 
     def _update_bungee(self, dt, plants):
         """Sky-drop state machine: descend → steal a plant → climb away."""
@@ -1704,7 +2245,8 @@ class Zombie:
         emits a landing ring + dust at touchdown).
         """
         ztype = random.choice(self.minion_pool)
-        row = random.randint(0, GRID_ROWS - 1)
+        import ai
+        row = random.choice(ai.intel.land_rows())
         x = SCREEN_WIDTH + 8
         target_y = self.grid_y + row * CELL_H + 15
         m = create_zombie(x, target_y, row, ztype)
@@ -1748,40 +2290,76 @@ class Zombie:
         kind = "_b" if self.use_b_sheet else "_a"
         return f"anim_zombie{kind}{suffix}"
 
+    def _frame_index(self):
+        """Sprite cell for the current state (see the class docstring)."""
+        n = self._FRAMES
+        if self.dying_timer > 0:
+            # one-shot: 7 cells across the 1 s dying window, then hold
+            return min(n - 1, int(self.die_clock * n))
+        if self.is_bungee:
+            return int(self.anim_time * 6) % n
+        if self.is_eating:
+            return int(self.eat_clock * self.EAT_FPS) % n
+        return int(self.walk_phase * n) % n
+
     def draw(self, screen):
         prefix = self._sheet_prefix()
-        frame_idx = int(self.anim_time * 8) % 6
+        frame_idx = self._frame_index()
+        foot_x = self.x + self.w // 2
+        foot_y = self.y + CELL_H - 15
+
+        # ---- Digger underground: a churning dirt mound instead of the body ----
+        if self.underground:
+            self._draw_burrow(screen, foot_x, foot_y)
+            self._bcx, self._btop = foot_x, foot_y - 30
+            self._bw, self._bh = 46, 30
+            self._vx, self._vy = foot_x - 23, foot_y - 30
+            self._draw_hp(screen)
+            return
+
         frame = assets_loader.frame(prefix, frame_idx)
         if frame is not None:
             if self.is_boss:
-                # boss drawn big & tinted dark with a red aura
-                big = assets_loader.scaled_frame(prefix, frame_idx, self.w, self.h)
-                big = big.copy()
-                dark = pygame.Surface(big.get_size(), pygame.SRCALPHA)
-                dark.fill((60, 0, 0, 90))
-                big.blit(dark, (0, 0))
-                screen.blit(big, (self.x, self.y))
+                big = assets_loader.tinted_frame(prefix, frame_idx, self.w, self.h,
+                                                 (60, 0, 0), 90)
                 vx, vy = self.x, self.y
+                if big is not None:
+                    assets_loader.blit_shadow(screen, foot_x, self.y + self.h - 6,
+                                              int(self.w * 0.85), 26, 120)
+                    screen.blit(big, (vx, vy))
             else:
-                # Anchor every frame by its opaque foot-contact point. The raw
-                # 60x58 slots shift the body horizontally by up to ~30 px, so
-                # fixed-slot blitting made a 0.3 px/frame walk look like jumping.
-                VW, VH = 99, 96
-                foot_x = self.x + self.w // 2
-                foot_y = self.y + CELL_H - 15
+                # One constant scale per sheet, anchored on the body centre +
+                # foot line (see assets_loader.frame_body) so a zombie never
+                # changes size or foot point when its state changes.
+                VH = ZOMBIE_BODY_H
                 if self.floating:
-                    foot_y -= 24  # airborne body hovers above the lawn
+                    foot_y -= 24      # airborne body hovers above the lawn
                 if self.is_bungee:
-                    foot_y = self.y + 92  # hanging under the cord
-                scaled, anchor_x, _ = assets_loader.frame_body(
-                    prefix, frame_idx, VW, VH)
+                    foot_y = self.y + 92   # hanging under the cord
+                if self.body_tint is not None:
+                    tinted = assets_loader.frame_body_tinted(
+                        prefix, frame_idx, VH, *self.body_tint)
+                else:
+                    tinted = None
+                scaled, anchor_x, baseline, body_w, body_h = \
+                    tinted or assets_loader.frame_body(prefix, frame_idx, VH)
                 vx = foot_x - anchor_x
-                # foot sits at the bottom of the padded sprite — never clips
-                vy = foot_y - VH
-                # tiny vertical bob is intentional, but never changes foot X.
-                if not self.is_eating and self.dying_timer <= 0 \
-                        and not self.floating and not self.is_bungee:
-                    vy += int(math.sin(self.anim_time * 9) * 1.5)
+                vy = foot_y - baseline
+                self._bcx = foot_x
+                self._bw, self._bh = body_w, body_h
+                moving = (not self.is_eating and self.dying_timer <= 0
+                          and not self.floating and not self.is_bungee)
+                if moving:
+                    # Bob is phase-locked to the walk cycle (not to wall time)
+                    # so the body rises on the same beat the feet plant.
+                    vy += int(math.sin(self.walk_phase * math.tau) * 2.0)
+                self._btop = vy + baseline - body_h
+                # contact shadow grounds the body on the lawn
+                if not self.floating and not self.is_bungee:
+                    sw = max(18, int(body_w * 0.95))
+                    sh = max(5, int(body_w * 0.30))
+                    a = 118 if self.dying_timer <= 0 else 70
+                    assets_loader.blit_shadow(screen, foot_x, foot_y - 2, sw, sh, a)
                 if self.is_bungee:
                     # bungee cord from the top of the sky down to the harness
                     pygame.draw.line(screen, (50, 50, 58),
@@ -1789,120 +2367,63 @@ class Zombie:
                     pygame.draw.line(screen, (90, 90, 100),
                                      (foot_x, -40), (foot_x, vy + 10), 1)
                 screen.blit(scaled, (vx, vy))
+                # Hit flash: light up the body's own silhouette rather than
+                # painting an opaque white rectangle over the sprite padding.
+                if self.hit_flash > 0:
+                    if self.body_tint is not None:
+                        flash = assets_loader.frame_body_tinted_flash(
+                            prefix, frame_idx, VH, *self.body_tint)
+                    else:
+                        flash = assets_loader.frame_body_flash(prefix, frame_idx, VH)
+                    if flash is not None:
+                        # frame_body_flash is cached per (sheet,frame,h) —
+                        # copy before stamping the flash alpha
+                        screen.blit(
+                            fx.faded(flash, min(255, int(255 * (self.hit_flash / 0.1) * 0.75))),
+                            (vx, vy))
         else:
             # fallback to wiki 96x96 zombie icon, scaled up
             img = assets_loader.scale(f"zombie_{self.zombie_type}", 96, 96)
             if img is not None:
                 vx = self.x + (self.w - 96) // 2
-                foot = self.y + CELL_H - 15
-                vy = foot - 96
+                vy = foot_y - 96
+                assets_loader.blit_shadow(screen, foot_x, foot_y - 2, 76, 20, 118)
                 screen.blit(img, (vx, vy))
             else:
                 vx, vy = self.x, self.y + 20
                 pygame.draw.ellipse(screen, (80, 80, 85), (self.x + 10, self.y + 20, 35, 30))
+            self._bcx = vx + 48
+            self._bw = self._bh = 96
+            self._btop = vy
         # cache draw anchor for accessories below
         self._vx = vx
         self._vy = vy
-        self._vh = 96 if not self.is_boss else self.h
-
-        # type accessories (drawn on top of the animated body)
-        ax = self._vx
-        ay = self._vy + 34 if self.is_boss else self._vy + 52  # chest height
-        if self.zombie_type == ZOMBIE_CONEHEAD:
-            pygame.draw.polygon(screen, (230, 112, 28), [
-                (ax + 28, self._vy + 8), (ax + 57, self._vy + 8),
-                (ax + 45, self._vy - 27),
-            ])
-            pygame.draw.polygon(screen, (255, 165, 55), [
-                (ax + 31, self._vy + 4), (ax + 54, self._vy + 4),
-                (ax + 45, self._vy - 21),
-            ], 2)
-        elif self.zombie_type == ZOMBIE_BUCKETHEAD:
-            bucket = pygame.Rect(ax + 26, self._vy - 19, 36, 30)
-            pygame.draw.rect(screen, (120, 128, 135), bucket, border_radius=4)
-            pygame.draw.rect(screen, (205, 210, 215), bucket, 3, border_radius=4)
-            pygame.draw.line(screen, (70, 75, 80), bucket.bottomleft, bucket.bottomright, 3)
-        elif self.zombie_type == ZOMBIE_FLAG:
-            pole_x = ax + 20
-            pygame.draw.line(screen, (150, 105, 55),
-                             (pole_x, self._vy + 20), (pole_x, self._vy + 82), 3)
-            pygame.draw.polygon(screen, (210, 35, 35), [
-                (pole_x, self._vy + 20), (pole_x + 34, self._vy + 27),
-                (pole_x, self._vy + 42),
-            ])
-        if self.zombie_type == ZOMBIE_NEWSPAPER and not self.enraged:
-            # newspaper in hands
-            nx = ax + 12
-            ny = ay
-            pygame.draw.rect(screen, (235, 232, 220), (nx, ny, 28, 18), border_radius=2)
-            pygame.draw.line(screen, (120, 120, 120), (nx + 2, ny + 5), (nx + 25, ny + 5), 1)
-            pygame.draw.line(screen, (120, 120, 120), (nx + 2, ny + 10), (nx + 25, ny + 10), 1)
-        elif self.zombie_type == ZOMBIE_NEWSPAPER and self.enraged:
-            # torn paper flying off
-            pygame.draw.rect(screen, (235, 232, 220), (ax + 2, self._vy + 26, 14, 9), border_radius=2)
-        if self.zombie_type == ZOMBIE_POLE and not self.has_vaulted:
-            # carrying the pole before the jump
-            pygame.draw.line(screen, (150, 90, 40),
-                             (ax + 34, self._vy + 6),
-                             (ax + 66, self._vy + 42), 3)
         if self.is_boss:
-            # boss crown/helmet + warning glow
-            cx = self.x + self.w // 2
-            pygame.draw.circle(screen, (200, 20, 20), (cx, self.y - 12), 14, 3)
-            for i in range(4):
-                a = self.anim_time * 6 + i * 1.57
-                pygame.draw.circle(screen, (255, 60, 40),
-                                   (int(cx + 20 * math.cos(a)), int(self.y - 12 + 20 * math.sin(a))), 4)
+            self._bcx = self.x + self.w // 2
+            self._bw, self._bh = self.w, self.h
+            self._btop = self.y
+
+        self._draw_gear(screen)
+        self._draw_ai_gear(screen)
+        if self.is_bungee:
+            self._draw_bungee_fx(screen)
 
         # Balloon Zombie: red balloon above the head, shrinking as it soaks
+        bcx = self._bcx
         if self.floating and self.balloon_hp > 0:
             ratio = max(0.15, self.balloon_hp / BALLOON_HP)
             br = int(17 * (0.55 + 0.45 * ratio))
-            bcx = self._vx + 49 + int(math.sin(self.anim_time * 3) * 3)
+            bx = bcx + int(math.sin(self.anim_time * 3) * 3)
             bcy = self._vy - 26 - br
             pygame.draw.line(screen, (80, 70, 70),
-                             (bcx, bcy + br - 2), (self._vx + 49, self._vy + 8), 1)
-            pygame.draw.circle(screen, (200, 40, 40), (bcx, bcy), br)
-            pygame.draw.circle(screen, (245, 100, 85), (bcx - br // 3, bcy - br // 3),
+                             (bx, bcy + br - 2), (bcx, self._vy + 8), 1)
+            pygame.draw.circle(screen, (200, 40, 40), (bx, bcy), br)
+            pygame.draw.circle(screen, (245, 100, 85), (bx - br // 3, bcy - br // 3),
                                max(2, br // 3))
-            pygame.draw.circle(screen, (140, 20, 20), (bcx, bcy), br, 2)
+            pygame.draw.circle(screen, (140, 20, 20), (bx, bcy), br, 2)
 
-        # HP bar above head
+        # HP bar above head (only once damaged — see _draw_hp)
         self._draw_hp(screen)
-        # hit flash overlay
-        if self.hit_flash > 0:
-            flash = pygame.Surface((self.w, self._vh + 8), pygame.SRCALPHA)
-            flash.fill((255, 255, 255, 100))
-            screen.blit(flash, (self.x, self._vy))
-
-        # ---- Bungee steal visuals ----
-        if self.is_bungee:
-            # 1) glow ring on the lawn during the steal phase
-            if self.bungee_phase == "steal" and self._steal_timer > 0:
-                t = 1.0 - (self._steal_timer / 0.55)   # 0..1 across the steal
-                ring_r = int(28 + t * 24)
-                alpha = int(220 * (1.0 - t * 0.7))
-                # cyan ring on the lawn
-                ring = pygame.Surface((ring_r * 2, ring_r * 2), pygame.SRCALPHA)
-                pygame.draw.circle(ring, (180, 240, 255, alpha),
-                                   (ring_r, ring_r), ring_r, 3)
-                pygame.draw.circle(ring, (255, 255, 255, int(alpha * 0.6)),
-                                   (ring_r, ring_r), ring_r // 2, 2)
-                cx = self._vx + self.w // 2
-                cy = self._vy + self._vh - 12
-                screen.blit(ring, (cx - ring_r, cy - ring_r))
-            # 2) the bungee is climbing away with a stolen plant in hand
-            elif self.bungee_phase == "climb" and self._stolen_type is not None:
-                carry_x = self._vx + self.w // 2 - 18
-                carry_y = self._vy + self._vh - 8
-                # draw a tiny plant sprite: green leafy ball
-                pygame.draw.circle(screen, (60, 160, 60),
-                                   (carry_x, carry_y), 14)
-                pygame.draw.circle(screen, (90, 200, 90),
-                                   (carry_x - 4, carry_y - 4), 6)
-                # tiny stem
-                pygame.draw.rect(screen, (70, 130, 50),
-                                 (carry_x - 2, carry_y + 8, 4, 8))
 
         # ---- Frozen overlay: ice crackles drawn on top of the body ----
         # Each crackle is a 3-segment zig-zag line that fades out.
@@ -1913,8 +2434,8 @@ class Zombie:
                 alpha = int(220 * (1.0 - t))
                 if alpha <= 0:
                     continue
-                cx = self._vx + self.w // 2 + int(xf * self.w)
-                cy = self._vy + self._vh // 2 + int(yf * self._vh)
+                cx = bcx + int(xf * self._bw)
+                cy = self._btop + self._bh // 2 + int(yf * self._bh)
                 # 3 zig-zag segments emanating from (cx, cy)
                 line_color = (220, 245, 255, alpha)
                 seg = 4
@@ -1931,27 +2452,272 @@ class Zombie:
                 # center sparkle dot (icy white)
                 pygame.draw.circle(screen, (240, 250, 255), (cx, cy), 2)
 
+    def _draw_gear(self, screen):
+        """Headgear / held props, all placed relative to the drawn body box."""
+        bcx, btop, bw, bh = self._bcx, self._btop, self._bw, self._bh
+        ay = btop + int(bh * 0.42)     # chest height on the drawn body
+        if self.zombie_type == ZOMBIE_CONEHEAD:
+            w = max(22, int(bw * 0.74))
+            h = max(30, int(w * 1.35))
+            screen.blit(assets_loader.cone_sprite(w, h), (bcx - w // 2, btop + 12 - h))
+        elif self.zombie_type == ZOMBIE_BUCKETHEAD:
+            w = max(26, int(bw * 0.72))
+            h = max(30, int(w * 1.15))
+            screen.blit(assets_loader.bucket_sprite(w, h), (bcx - w // 2, btop + 10 - h))
+        elif self.zombie_type == ZOMBIE_FLAG:
+            # Pole rises from the shoulder on the trailing side and the banner
+            # flies clear of the head — at bcx-18 the flag covered the face.
+            fw, fh = max(28, int(bw * 0.80)), max(44, int(bh * 0.70))
+            px = bcx + int(bw * 0.28)
+            screen.blit(assets_loader.flag_sprite(fw, fh), (px, btop - fh + int(bh * 0.34)))
+        if self.zombie_type == ZOMBIE_NEWSPAPER and not self.enraged:
+            screen.blit(assets_loader.newspaper_sprite(32, 22), (bcx - 31, ay - 2))
+        elif self.zombie_type == ZOMBIE_NEWSPAPER and self.enraged:
+            # torn scrap flying off
+            pygame.draw.rect(screen, (238, 235, 224), (bcx - 20, btop + 26, 14, 9))
+            pygame.draw.rect(screen, (176, 172, 160), (bcx - 20, btop + 26, 14, 9), 1)
+        if self.zombie_type == ZOMBIE_POLE and not self.has_vaulted:
+            # Held out ahead of the body (zombies walk left) instead of
+            # diagonally across the face.
+            pw, ph = max(16, int(bw * 0.32)), max(40, int(bh * 0.62))
+            screen.blit(assets_loader.pole_sprite(pw, ph),
+                        (bcx - int(bw * 0.62), btop + int(bh * 0.10)))
+        if self.is_boss:
+            cx = self.x + self.w // 2
+            pygame.draw.circle(screen, (200, 20, 20), (cx, self.y - 12), 14, 3)
+            for i in range(4):
+                a = self.anim_time * 6 + i * 1.57
+                pygame.draw.circle(screen, (255, 60, 40),
+                                   (int(cx + 20 * math.cos(a)),
+                                    int(self.y - 12 + 20 * math.sin(a))), 4)
+
+    def _draw_ai_gear(self, screen):
+        """Accessories that name each AI variant, plus the rally aura.
+
+        Everything here is placed against a *fractional* body box
+        (``_btop``/``_bh`` are the drawn body's real top and height, measured
+        from the sprite's own alpha bounds) rather than the sprite slot, so
+        the proportions hold for any sheet scale.
+
+        Rule of thumb used throughout: the head occupies the top ~30% of the
+        body, the chest ~30-55%, the legs the rest. Gear that covers the face
+        makes the zombie unreadable, so head props sit *above* ``head_top``
+        and chest props stay in the torso band.
+        """
+        if not self.is_smart:
+            return
+        bcx, btop, bw, bh = self._bcx, self._btop, self._bw, self._bh
+        head_top = btop + int(bh * 0.02)
+        chest = btop + int(bh * 0.42)         # where the torso reads
+        half = max(8, bw // 2)
+
+        # Rally aura: a soft ground-glow under any zombie the commander has
+        # buffed, drawn first so the body stays on top of it.
+        if self.rally_timer > 0:
+            pulse = 0.5 + 0.5 * math.sin(self.anim_time * 7.0)
+            aura = _rally_aura()
+            aura = fx.faded(aura, int(55 + 65 * pulse))
+            ax = bcx
+            ay = btop + int(bh * 0.80)        # around the feet, not the face
+            screen.blit(aura, aura.get_rect(center=(ax, ay)))
+
+        if self.is_tactician:
+            # Violet beret sitting on the crown (overlapping the skull by a
+            # few px, or it reads as a hat hovering in the air).
+            hat_w = int(bw * 0.90)
+            hat_h = max(6, int(bh * 0.13))
+            hx = bcx - hat_w // 2
+            hy = head_top + int(bh * 0.045)
+            pygame.draw.ellipse(screen, (74, 48, 122), (hx, hy, hat_w, hat_h))
+            pygame.draw.ellipse(screen, (124, 92, 190),
+                                (hx + 2, hy + 1, int(hat_w * 0.68), max(3, hat_h - 3)))
+            pygame.draw.circle(screen, (172, 142, 246),
+                               (bcx + int(hat_w * 0.44), hy + 1),
+                               max(2, int(bw * 0.09)))
+            # sash across the chest: shoulder → opposite hip
+            pygame.draw.line(screen, (132, 98, 200),
+                             (bcx - int(bw * 0.30), chest - int(bh * 0.06)),
+                             (bcx + int(bw * 0.26), chest + int(bh * 0.20)),
+                             max(3, int(bw * 0.16)))
+            if self.transfer_t > 0:
+                # Ghost marker at the lane being hopped to.
+                gy = int(self._transfer_to_y) + 30
+                pygame.draw.ellipse(screen, (150, 120, 220),
+                                    (bcx - 12, gy - 6, 24, 10), 2)
+        elif self.is_digger:
+            # Mining helmet with a lit lamp, shovel slung across the back.
+            pygame.draw.ellipse(screen, (196, 152, 70),
+                                (bcx - half, head_top - 2, bw, int(bh * 0.13)))
+            pygame.draw.ellipse(screen, (232, 192, 104),
+                                (bcx - half + 2, head_top - 1,
+                                 int(bw * 0.70), int(bh * 0.08)))
+            lamp_x = bcx
+            lamp_y = head_top + int(bh * 0.10)
+            pygame.draw.circle(screen, (255, 244, 170), (lamp_x, lamp_y),
+                               max(3, int(bw * 0.11)))
+            pygame.draw.circle(screen, (255, 255, 235), (lamp_x, lamp_y),
+                               max(1, int(bw * 0.05)))
+            # Shaft runs behind the shoulder so it never crosses the face.
+            pygame.draw.line(screen, (150, 108, 56),
+                             (bcx - int(bw * 0.42), head_top),
+                             (bcx - int(bw * 0.10), btop + int(bh * 0.74)),
+                             max(3, int(bw * 0.07)))
+            tip_x, tip_y = bcx - int(bw * 0.14), btop + int(bh * 0.82)
+            pygame.draw.polygon(screen, (182, 188, 196), [
+                (tip_x - 5, tip_y - 4), (tip_x + 6, tip_y - 2),
+                (tip_x + 1, tip_y + 8)])
+            if self.dig_phase == "burrow":
+                t = min(1.0, self.dig_t / (DIGGER_BURROW_S * 0.5))
+                pygame.draw.circle(screen, (120, 92, 55),
+                                   (bcx, self._vy + int(bh * (0.55 + 0.4 * t))),
+                                   int(14 + 20 * t), 2)
+        elif self.is_healer:
+            # Apothecary apron + a pulsing cross on the chest (not the face).
+            aw = int(bw * 0.38)
+            ah = int(bh * 0.26)
+            ax0 = bcx - aw // 2
+            ay0 = chest + int(bh * 0.01)
+            # Off-white, not pure white: at full brightness the apron glared
+            # like a placard and swallowed the zombie's own shading.
+            pygame.draw.rect(screen, (222, 234, 226), (ax0, ay0, aw, ah),
+                             border_radius=3)
+            # A soft edge instead of a hard outline, so the apron reads as
+            # cloth over the body rather than a pasted-on white box.
+            pygame.draw.rect(screen, (186, 202, 190), (ax0, ay0, aw, ah), 1,
+                             border_radius=3)
+            pygame.draw.line(screen, (210, 222, 212),
+                             (ax0 + 1, ay0 + ah - 2), (ax0 + aw - 2, ay0 + ah - 2), 1)
+            pulse = 0.5 + 0.5 * math.sin(self.anim_time * 4.5)
+            k = max(3, int(bw * 0.12 + 2 * pulse))
+            cx2 = bcx
+            cy2 = ay0 + ah // 2
+            t = max(2, int(bw * 0.06))
+            pygame.draw.rect(screen, (54, 190, 96), (cx2 - t // 2, cy2 - k, t, k * 2))
+            pygame.draw.rect(screen, (54, 190, 96), (cx2 - k, cy2 - t // 2, k * 2, t))
+        elif self.is_commander:
+            # Officer: peaked cap, gold epaulettes, a sash — NOT a full cape
+            # (a cape this size reads as a red blob and hides the whole body).
+            cap_w = int(bw * 0.86)
+            pygame.draw.ellipse(screen, (48, 48, 56),
+                                (bcx - cap_w // 2, head_top - int(bh * 0.05),
+                                 cap_w, int(bh * 0.13)))
+            pygame.draw.ellipse(screen, (72, 74, 86),
+                                (bcx - cap_w // 2 + 2, head_top - int(bh * 0.05),
+                                 int(cap_w * 0.72), int(bh * 0.08)))
+            # peaked brim facing the way it walks (left)
+            pygame.draw.polygon(screen, (34, 34, 40), [
+                (bcx - cap_w // 2, head_top + int(bh * 0.06)),
+                (bcx - cap_w // 2 - int(bw * 0.24), head_top + int(bh * 0.09)),
+                (bcx - cap_w // 2, head_top + int(bh * 0.02)),
+            ])
+            # gold badge
+            pygame.draw.circle(screen, (232, 196, 84),
+                               (bcx, head_top + int(bh * 0.03)),
+                               max(2, int(bw * 0.08)))
+            # epaulette bars on both shoulders
+            for sx in (-1, 1):
+                ex = bcx + sx * int(bw * 0.40)
+                pygame.draw.rect(screen, (232, 196, 84),
+                                 (ex - 5, chest - int(bh * 0.10), 10, 4),
+                                 border_radius=2)
+            # crimson sash across the chest
+            pygame.draw.line(screen, (176, 40, 44),
+                             (bcx + int(bw * 0.34), chest - int(bh * 0.12)),
+                             (bcx - int(bw * 0.30), chest + int(bh * 0.22)),
+                             max(4, int(bw * 0.18)))
+
+    def _draw_burrow(self, screen, foot_x, foot_y):
+        """Dirt mound that replaces the body while a digger is underground."""
+        w, h = 54, 26
+        mound = _burrow_mound()
+        screen.blit(mound, (foot_x - w // 2, foot_y - h + 2))
+        # churning clods thrown up behind the mound
+        for i in range(3):
+            ph = (self.anim_time * 3.0 + i * 0.33) % 1.0
+            dx = int((ph - 0.5) * 46)
+            dy = int(-12 * math.sin(ph * math.pi))
+            r = max(1, int(4 * (1.0 - ph)))
+            pygame.draw.circle(screen, (118, 90, 52),
+                               (foot_x + dx, foot_y - 12 + dy), r)
+
     def _draw_hp(self, screen):
-        bw = 60 if self.is_boss else 52
+        """Slim PvZ-style health pip, hidden until the zombie is hurt.
+
+        A bar over every full-health zombie was visual noise — the player only
+        needs to read health on the ones they have actually damaged. Bosses and
+        balloons keep theirs always visible.
+        """
+        total = self.hp + max(0, self.balloon_hp)
+        if total >= self.max_hp and not self.is_boss and not self.floating:
+            return
+        bw = 60 if self.is_boss else 40
         bh = 5 if self.is_boss else 4
-        # above the (now upscaled) head: normal head ≈ self.y-13
         by = (self.y - 30) if self.is_boss else (self.y - 26)
         if self.floating:
             by -= 24
+        if self.underground:
+            by = self.y - 6
         bx = self.x + (self.w - bw) // 2
-        pygame.draw.rect(screen, COLOR_BAR_BG, (bx, by, bw, bh))
-        total = self.hp + max(0, self.balloon_hp)
-        fill_w = int(bw * (total / self.max_hp))
-        pygame.draw.rect(screen, (200, 50, 50), (bx, by, fill_w, bh))
+        ratio = max(0.0, min(1.0, total / float(self.max_hp)))
+        # dark backing + rounded ends so it reads as a gauge, not a red slab
+        pygame.draw.rect(screen, (28, 22, 22), (bx - 1, by - 1, bw + 2, bh + 2),
+                         border_radius=3)
+        fill_w = int(bw * ratio)
+        if fill_w > 0:
+            # green → amber → red as the zombie goes down
+            if ratio > 0.6:
+                col = (96, 200, 72)
+            elif ratio > 0.3:
+                col = (226, 178, 52)
+            else:
+                col = (214, 62, 52)
+            pygame.draw.rect(screen, col, (bx, by, fill_w, bh), border_radius=2)
+            # Gloss on the top half. A lighter *shade* rather than a
+            # translucent white — pygame.draw ignores the alpha of an RGBA
+            # colour on the display surface, so (255,255,255,46) painted the
+            # whole gauge solid white.
+            gloss = tuple(min(255, c + 70) for c in col)
+            pygame.draw.rect(screen, gloss, (bx, by, fill_w, max(1, bh // 2)),
+                             border_radius=2)
+
+    def _draw_bungee_fx(self, screen):
+        """Glow ring while snatching, plus the loot carried back up the cord."""
+        bcx = self._bcx
+        if self.bungee_phase == "steal" and self._steal_timer > 0:
+            t = 1.0 - (self._steal_timer / 0.55)   # 0..1 across the steal
+            ring_r = int(28 + t * 24)
+            alpha = int(220 * (1.0 - t * 0.7))
+            ring = _get_ring_sprite(ring_r, (180, 240, 255), alpha)
+            cy = self._btop + self._bh - 12
+            screen.blit(ring, (bcx - ring_r, cy - ring_r))
+        elif self.bungee_phase == "climb" and self._stolen_type is not None:
+            carry_x = bcx - 18
+            carry_y = self._btop + self._bh - 8
+            pygame.draw.circle(screen, (60, 160, 60), (carry_x, carry_y), 14)
+            pygame.draw.circle(screen, (90, 200, 90), (carry_x - 4, carry_y - 4), 6)
+            pygame.draw.rect(screen, (70, 130, 50), (carry_x - 2, carry_y + 8, 4, 8))
 
     def rect(self):
-        """Combat hitbox aligned to the visible body, not the oversized cell box."""
+        """Combat hitbox aligned to the visible body, not the oversized cell box.
+
+        The Rect is reused between calls: this runs several times per zombie
+        per frame (mower sweep, projectile sweep, house check) and every one
+        used to allocate. Callers only read it immediately, never hold it.
+        """
+        r = self._hit_rect
         if self.is_boss:
-            return pygame.Rect(int(self.x + 20), int(self.y + 15),
-                               max(20, self.w - 40), max(30, self.h - 25))
-        return pygame.Rect(int(self.x + 18), int(self.y + 8), 58, 98)
+            r.update(int(self.x + 20), int(self.y + 15),
+                     max(20, self.w - 40), max(30, self.h - 25))
+        else:
+            r.update(int(self.x + 18), int(self.y + 8), 58, 98)
+        return r
 
     def take_damage(self, dmg):
+        # A tunnelling digger is below the lawn: peas sail over it. This is the
+        # whole point of the burrow, and it is what makes the digger a real
+        # counter to a stacked wall instead of just a fast zombie.
+        if self.underground:
+            return
         # Airborne balloon soaks damage first (PvZ1 parity: 155 pops the
         # balloon, 290 total kills → the body continues at 135). Overflow
         # beyond the pop carries straight into the body.
@@ -1989,3 +2755,5 @@ def create_zombie(x, y, row, zombie_type=ZOMBIE_BASIC, speed_mult=1.0, dmg_mult=
     if dmg_mult != 1.0:
         z.eat_damage = int(30 * dmg_mult)
     return z
+
+

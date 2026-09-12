@@ -114,6 +114,11 @@ ZOMBIE_POLE = "pole"
 ZOMBIE_BOSS = "boss"
 ZOMBIE_BALLOON = "balloon"   # flies in over the lawn; 155 dmg pops the balloon
 ZOMBIE_BUNGEE = "bungee"     # drops from the sky on a cord and steals a plant
+# --- AI zombies: these read the battlefield and adapt (see ai.py) ---
+ZOMBIE_TACTICIAN = "tactician"   # hops lanes to attack the weakest row
+ZOMBIE_DIGGER = "digger"         # burrows under the defense and surfaces behind it
+ZOMBIE_HEALER = "healer"         # hangs back and mends nearby zombies
+ZOMBIE_COMMANDER = "commander"   # buffs every zombie around it
 
 ZOMBIE_INFO = {
     ZOMBIE_BASIC: {"hp": 200, "speed": 18, "reward": 5},       # dies to 10 pea shots (PvZ parity)
@@ -127,7 +132,40 @@ ZOMBIE_INFO = {
     # every shooter can pop it — but it flies over plants and lawnmowers)
     ZOMBIE_BALLOON: {"hp": 290, "speed": 24, "reward": 15},
     ZOMBIE_BUNGEE: {"hp": 450, "speed": 0, "reward": 25},      # PvZ1: 450 HP plant thief
+    # AI zombies. The tactician is a fast flanker, the digger bypasses walls
+    # entirely, the healer/commander make the whole horde harder to out-DPS —
+    # all four are meant to punish a one-shape defense.
+    ZOMBIE_TACTICIAN: {"hp": 320, "speed": 20, "reward": 20},
+    ZOMBIE_DIGGER: {"hp": 260, "speed": 26, "reward": 20},
+    ZOMBIE_HEALER: {"hp": 240, "speed": 12, "reward": 18},
+    ZOMBIE_COMMANDER: {"hp": 520, "speed": 13, "reward": 30},
 }
+
+# --- AI tuning -------------------------------------------------------------
+TACTICIAN_TRANSFER_S = 5.5     # seconds between lane evaluations
+TACTICIAN_TRANSFER_T = 0.55    # how long the hop animation lasts
+DIGGER_BURROW_S = 1.1          # dive/emerge animation time
+DIGGER_SPEED_MULT = 1.5        # underground travel is faster
+DIGGER_MIN_TUNNEL = 90.0       # px of tunnelling even with no plants to pass
+HEALER_RANGE = 130.0           # px radius of the mend beam
+HEALER_INTERVAL = 2.6          # seconds between heals
+HEALER_AMOUNT = 55             # hp restored per heal
+COMMANDER_RANGE = 190.0        # px radius of the rally aura
+COMMANDER_SPEED_BUFF = 1.30    # +30% speed for rallied zombies
+COMMANDER_DMG_BUFF = 1.35      # +35% bite damage for rallied zombies
+COMMANDER_PULSE_S = 6.0        # seconds between rally pulses
+
+# Director (adaptive wave composition) tuning
+DIRECTOR_ENABLED = True
+DIRECTOR_MAX_ADAPT = 0.55      # how far wave composition may drift from the script
+# A lane is only worth flanking if it actually holds firepower. Without this
+# floor a single peashooter among sunflowers dominates a tiny threat total and
+# reads as a "stacked lane" purely because sunflowers score so low.
+DIRECTOR_STACK_MIN_THREAT = 18.0
+# Endless survival has no authored wave table to introduce the AI zombies in,
+# so it unlocks them by wave number instead. Adventure levels ignore this and
+# gate on their own waves — see WaveSystem._ai_unlocked.
+AI_UNLOCK_WAVE = 3
 
 BALLOON_HP = 155      # damage needed to pop the balloon (PvZ1 parity)
 BUNGEE_DESCEND_S = 2.8  # seconds from sky to lawn
@@ -150,6 +188,10 @@ PLANT_LEVEL_STATS = {
     PLANT_FUMESHROOM: {"damage": (20, 40, 60)},
     PLANT_LILYPAD: {"hp": (400, 800, 1600)},
     PLANT_SNOWPEA: {"damage": (20, 40, 60)},
+    # Cob Cannon: bomb_damage/bomb_radius are the KernelBomb payload (pixels),
+    # distinct from cherry's cell-based "radius" multiplier.
+    PLANT_COBCANNON: {"damage": (1800, 3000, 4500),
+                      "bomb_radius": (110, 140, 175)},
 }
 
 # Plant Food (能量豆, PvZ2 signature item): falls from the sky, click to store,
@@ -199,24 +241,6 @@ LAWNMOWER_SPEED = 520  # px/s when activated
 HOUSE_LEFT_WALL = LAWNMOWER_X - 8  # visible zombie body must pass mower before defeat
 HOUSE_HP = 1000  # higher so eating feels like the PvZ "brains eaten" delay
 HOUSE_EAT_DPS = 300  # per second per zombie at the door (~3.3s for one zombie)
-
-# UI Bar — top of screen, like original PvZ. Cards keep their native art ratio
-# (49x69) so they are NOT squashed; bar height leaves room below for the lawn.
-UI_BAR_Y = 0
-UI_BAR_H = 76
-SEED_BAR_X = 10
-SEED_BAR_W = SCREEN_WIDTH - 20
-# Sun jar (embedded in seed bar, left side)
-SUN_JAR_X = SEED_BAR_X + 8
-SUN_JAR_Y = UI_BAR_Y + 3
-SUN_JAR_W = 48
-SUN_JAR_H = 70
-# Seed card layout — native PvZ card art is 49x69
-SEED_CARD_W = 49
-SEED_CARD_H = 69
-SEED_CARD_GAP = 8
-# Reserve room for both the 48px sun icon and a 62px numeric counter.
-SEED_CARD_START_X = SUN_JAR_X + SUN_JAR_W + 70
 
 # Tooltips / messages
 TOOLTIP_FONT_SIZE = 18

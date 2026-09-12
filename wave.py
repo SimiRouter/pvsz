@@ -2,10 +2,18 @@
 
 import random
 from constants import *
+import ai
 import i18n
 tr = i18n.tr
 from entities import create_zombie
 from fx import cached_text
+
+
+# AI zombie types the director may introduce. A level "unlocks" one simply by
+# naming it somewhere in its own wave table — so the authored ramp in
+# levels.py is what decides when the player first meets each of them, and the
+# director only varies *how many* show up from there on.
+_AI_TYPES = (ZOMBIE_TACTICIAN, ZOMBIE_DIGGER, ZOMBIE_HEALER, ZOMBIE_COMMANDER)
 
 
 class WaveSystem:
@@ -27,6 +35,10 @@ class WaveSystem:
         # Survival scaling: when True, every wave's zombies get faster and
         # bite harder as the global wave number grows (endless mode).
         self.scaling = False
+        # Adaptive wave composition. Reads the per-frame battlefield snapshot
+        # in ai.intel and biases each wave toward whatever the player's
+        # defense is weak against (see ai.Director).
+        self.director = ai.Director(enabled=DIRECTOR_ENABLED)
 
     @staticmethod
     def scaling_for_wave(wave_number):
@@ -34,6 +46,46 @@ class WaveSystem:
         speed = min(SURVIVAL_SPEED_CAP, 1.0 + SURVIVAL_SPEED_PER_WAVE * (wave_number - 1))
         dmg = min(SURVIVAL_DMG_CAP, 1.0 + SURVIVAL_DMG_PER_WAVE * (wave_number - 1))
         return speed, dmg
+
+    # ------------------------------------------------------ director support
+    @staticmethod
+    def _types_of(wave_def):
+        """The type list of a wave, which may be a 3- or 4-tuple."""
+        return wave_def[2] if len(wave_def) == 4 else wave_def[1]
+
+    def _allowed_types(self, upto=None):
+        """Types the level has introduced *so far*, through wave ``upto``.
+
+        Deliberately progressive rather than the union over the whole table:
+        a level that saves Bucketheads for its final wave must not have the
+        Director sprinkle them through wave one. Counting only the waves the
+        player has already seen keeps the authored ramp intact while still
+        letting the Director bring back anything already met.
+
+        ``upto`` defaults to the wave currently being composed.
+        """
+        if upto is None:
+            upto = self.wave_index
+        allowed = set()
+        for wave_def in self.waves[:upto + 1]:
+            allowed.update(self._types_of(wave_def))
+        return allowed
+
+    def _ai_unlocked(self):
+        """Whether the AI zombie roster is in play for this level at all.
+
+        Adventure levels gate on their wave table — a level gains an AI zombie
+        the moment (and not before) the player reaches the wave that names it.
+        Endless survival has no authored table to gate on, so it introduces
+        them by wave number instead: early waves stay a warm-up, then the
+        smart ones start showing up.
+        """
+        if self.scaling:
+            return self.wave_index + 1 >= AI_UNLOCK_WAVE
+        whole = set()
+        for wave_def in self.waves:
+            whole.update(self._types_of(wave_def))
+        return any(t in _AI_TYPES for t in whole)
 
     def start_wave(self):
         if self.wave_index >= self.wave_count:
@@ -56,15 +108,32 @@ class WaveSystem:
             min(3.2, delay / 2000.0 if delay > 0 else
                 (WAVE_ZOMBIE_SPACING_BASE - (self.wave_index + 1) * 300) / 1000.0),
         )
-        for i in range(count):
-            ztype = random.choice(types)
-            row = random.randint(0, GRID_ROWS - 1)
-            self.zombies_to_spawn.append((ztype, row))
+        # Composition: the level's scripted pool is the floor, and the
+        # Director swaps up to DIRECTOR_MAX_ADAPT of the slots for counters to
+        # whatever the player has actually built — bucketheads against massed
+        # shooters, diggers against a wall line, a tactician against one
+        # overloaded lane. The row is left as None and resolved at spawn time,
+        # so it reflects the board as it is when the zombie walks on rather
+        # than as it was when the wave was queued.
+        allowed = self._allowed_types()
+        if self.scaling and self._ai_unlocked():
+            # Endless survival has no authored table naming AI zombies, so the
+            # progressive allowed-set above never contains them. Merge them in
+            # once the wave-number gate (_ai_unlocked) opens, otherwise the
+            # director's unlock_ai flag would be silently dead in survival.
+            allowed = allowed | set(_AI_TYPES)
+        roster = self.director.compose(types, count, allowed,
+                                       unlock_ai=self._ai_unlocked())
+        for ztype in roster:
+            self.zombies_to_spawn.append((ztype, None))
         # Huge waves in the endless mode drop a Bungee Zombie from the sky —
         # the original's nasty surprise for unguarded columns.
         if self.scaling and wave_number % 5 == 0:
             col = random.randint(1, GRID_COLS - 1)
-            self.zombies_to_spawn.append((ZOMBIE_BUNGEE, random.randint(0, GRID_ROWS - 1), col))
+            # Bungee descends onto a lawn row — water rows have nothing to
+            # steal and a hovering zombie over open pool reads as a bug.
+            self.zombies_to_spawn.append(
+                (ZOMBIE_BUNGEE, random.choice(ai.intel.land_rows()), col))
         self.spawn_timer = 0
         self.zombies_spawned = 0
         self.wave_zombies_remaining = len(self.zombies_to_spawn)
@@ -92,6 +161,11 @@ class WaveSystem:
                                       self.current_speed_mult, self.current_dmg_mult)
                 else:
                     ztype, row = spawn_def
+                    if row is None:
+                        # Resolved now, not when the wave was queued: the
+                        # Director picks the softest lane as it stands at the
+                        # moment this zombie actually walks on.
+                        row = self.director.choose_row()
                     x = SCREEN_WIDTH + 8  # fully off-canvas but visible almost immediately
                     y = self.grid_y + row * CELL_H + 15
                     z = create_zombie(x, y, row, ztype,
