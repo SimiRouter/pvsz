@@ -3,15 +3,6 @@
 from constants import *
 
 # ============================================================
-# Background types
-# ============================================================
-BG_DAY = "day"
-BG_NIGHT = "night"
-BG_POOL = "pool"
-BG_FOG = "fog"
-BG_ROOF = "roof"
-
-# ============================================================
 # Adventure Mode: 5 worlds, 16 levels total (including 5-4 boss)
 # ============================================================
 ADVENTURE_LEVELS = [
@@ -106,7 +97,9 @@ ADVENTURE_LEVELS = [
             (5, [ZOMBIE_BASIC], 7000),
             (8, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD], 5500),
             (10, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD, ZOMBIE_FLAG], 4500),
-            (12, [ZOMBIE_CONEHEAD, ZOMBIE_BUCKETHEAD, ZOMBIE_FLAG], 3500),
+            # Introduction: the player has just spent a world learning that a
+            # wall line stops everything. The Digger surfaces *behind* it.
+            (12, [ZOMBIE_CONEHEAD, ZOMBIE_BUCKETHEAD, ZOMBIE_FLAG, ZOMBIE_DIGGER], 3500),
         ],
         "start_sun": 200, "special": "pool",
     },
@@ -127,7 +120,10 @@ ADVENTURE_LEVELS = [
         "waves": [
             (4, [ZOMBIE_BASIC], 8000),
             (6, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD], 6000),
-            (8, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD, ZOMBIE_FLAG], 5000),
+            # Fog hides the approach, so the lane-hopping Tactician is at its
+            # most disorienting here.
+            (8, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD, ZOMBIE_FLAG,
+                 ZOMBIE_TACTICIAN, ZOMBIE_DIGGER], 5000),
         ],
         "start_sun": 150, "special": "fog",
     },
@@ -137,8 +133,12 @@ ADVENTURE_LEVELS = [
         "waves": [
             (5, [ZOMBIE_BASIC], 7000),
             (8, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD], 5500),
-            (10, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD, ZOMBIE_FLAG], 4500),
-            (12, [ZOMBIE_CONEHEAD, ZOMBIE_BUCKETHEAD, ZOMBIE_BALLOON, ZOMBIE_FLAG], 3500),
+            (10, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD, ZOMBIE_FLAG, ZOMBIE_TACTICIAN], 4500),
+            # Introduction: the Healer. It hangs back and mends the front line,
+            # so a defense that only kills the leading zombie never makes
+            # progress — the player has to reach past it.
+            (12, [ZOMBIE_CONEHEAD, ZOMBIE_BUCKETHEAD, ZOMBIE_BALLOON, ZOMBIE_FLAG,
+                  ZOMBIE_TACTICIAN, ZOMBIE_DIGGER, ZOMBIE_HEALER], 3500),
         ],
         "start_sun": 150, "special": "fog",
     },
@@ -149,7 +149,7 @@ ADVENTURE_LEVELS = [
         "plants": [PLANT_PEASHOOTER, PLANT_SUNFLOWER, PLANT_WALLNUT],
         "waves": [
             (3, [ZOMBIE_BASIC], 9000),
-            (5, [ZOMBIE_BASIC, ZOMBIE_BASIC], 7000),
+            (5, [ZOMBIE_BASIC, ZOMBIE_BASIC, ZOMBIE_TACTICIAN], 7000),
         ],
         "start_sun": 150, "special": "roof",
     },
@@ -158,8 +158,9 @@ ADVENTURE_LEVELS = [
         "plants": [PLANT_PEASHOOTER, PLANT_SUNFLOWER, PLANT_WALLNUT, PLANT_CHERRYBOMB],
         "waves": [
             (4, [ZOMBIE_BASIC], 8000),
-            (6, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD], 6000),
-            (8, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD, ZOMBIE_FLAG], 5000),
+            (6, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD, ZOMBIE_DIGGER], 6000),
+            (8, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD, ZOMBIE_FLAG,
+                 ZOMBIE_DIGGER, ZOMBIE_HEALER], 5000),
         ],
         "start_sun": 150, "special": "roof",
     },
@@ -169,8 +170,13 @@ ADVENTURE_LEVELS = [
         "waves": [
             (5, [ZOMBIE_BASIC], 7000),
             (8, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD], 5500),
-            (10, [ZOMBIE_BASIC, ZOMBIE_NEWSPAPER, ZOMBIE_FLAG], 4500),
-            (12, [ZOMBIE_CONEHEAD, ZOMBIE_BUCKETHEAD, ZOMBIE_NEWSPAPER, ZOMBIE_BALLOON], 3500),
+            (10, [ZOMBIE_BASIC, ZOMBIE_NEWSPAPER, ZOMBIE_FLAG,
+                  ZOMBIE_DIGGER, ZOMBIE_HEALER], 4500),
+            # Introduction: the Commander. Everything near it hits harder and
+            # moves faster, so letting a pack form is what kills you.
+            (12, [ZOMBIE_CONEHEAD, ZOMBIE_BUCKETHEAD, ZOMBIE_NEWSPAPER, ZOMBIE_BALLOON,
+                  ZOMBIE_TACTICIAN, ZOMBIE_DIGGER, ZOMBIE_HEALER,
+                  ZOMBIE_COMMANDER], 3500),
         ],
         "start_sun": 150, "special": "roof",
     },
@@ -179,8 +185,9 @@ ADVENTURE_LEVELS = [
         "plants": [PLANT_PEASHOOTER, PLANT_SUNFLOWER, PLANT_WALLNUT, PLANT_CHERRYBOMB, PLANT_FUMESHROOM],
         "waves": [
             (4, [ZOMBIE_BASIC], 6000),
-            (6, [ZOMBIE_BASIC, ZOMBIE_NEWSPAPER], 5000),
-            (8, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD, ZOMBIE_POLE, ZOMBIE_BALLOON], 4000),
+            (6, [ZOMBIE_BASIC, ZOMBIE_NEWSPAPER, ZOMBIE_TACTICIAN], 5000),
+            (8, [ZOMBIE_BASIC, ZOMBIE_CONEHEAD, ZOMBIE_POLE, ZOMBIE_BALLOON,
+                 ZOMBIE_DIGGER, ZOMBIE_HEALER, ZOMBIE_COMMANDER], 4000),
             (1, [ZOMBIE_BOSS], 2500),
         ],
         "start_sun": 300, "special": "roof",

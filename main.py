@@ -33,6 +33,13 @@ def _map_mouse_event(event, view):
         return event
     pos = _to_logical(event.pos, view)
     if pos is None:
+        # A release outside the aspect-fitted viewport must still reach the
+        # game so an in-progress seed drag is cancelled instead of getting
+        # stuck until the next click.
+        if event.type == pygame.MOUSEBUTTONUP:
+            attrs = event.dict.copy()
+            attrs["pos"] = (-1, -1)
+            return pygame.event.Event(event.type, attrs)
         return None
     attrs = event.dict.copy()
     attrs["pos"] = pos
@@ -87,6 +94,9 @@ def main():
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                # Persist an in-progress survival run's best-wave record;
+                # otherwise closing the window mid-run silently loses it.
+                game._record_survival_run()
                 running = False
             elif event.type == pygame.VIDEORESIZE and not fullscreen:
                 window = pygame.display.set_mode((max(640, event.w), max(360, event.h)),

@@ -16,6 +16,8 @@ from levels import ADVENTURE_LEVELS, SURVIVAL_MODES
 import save as save_mod
 from save import derive_unlocked
 import audio as audio_mod
+import ai
+import particles
 import i18n
 tr = i18n.tr
 
@@ -74,16 +76,13 @@ class Game:
         self.wave_warning = WaveWarning()
         self.hover_plant = None    # Plant instance currently hovered
         self.hover_zombie = None   # Zombie instance currently hovered
+        self.hover_sun = None      # Sun under the cursor (claims the click)
         self.last_wave_announced = -1  # which wave index we already announced
-        self.plant_poof = []       # soil poof circles when planting
-        self.plant_debris = []     # leaf/petal particles when a plant is eaten
-        self.pea_impact = []       # spark/pea-shard burst on projectile impact
-        self.balloon_pop = []      # red rubber shreds when a Balloon pops
-        self.mow_dust = []         # grey dust puffs trailing the lawnmower
-        self.zombie_heads = []     # head/limb sprites flying off on zombie death
-        self.food_rings = []       # plant-food release ring radiating outward
-        self.boss_aura = []        # boss summon aura + death shockwave
-        self.grass_prints = []     # brown footprint ellipses when a zombie steps
+        # Every transient visual effect — soil poofs, pea sparks, balloon
+        # shreds, mower dust, zombie chunks, plant-food rings, boss auras and
+        # grass prints — lives in one particle system (particles.py) instead
+        # of nine hand-rolled lists with nine update loops and nine draw loops.
+        self.fx = particles.Effects()
         self.coin_drops = []       # gold coin pops when wave/level complete
         # Wave-start cinematic zoom + freeze: applied when wave_warning is alive.
         # Stored as a state so the draw side can read & interpolate.
@@ -100,13 +99,22 @@ class Game:
         self.flash_timer = 0.0     # white flash on explosions
         self.current_loadout = None  # picked seed cards of the running level
         self._press = None         # (seed button, origin pos) while pressing a card
+        self._cob_armed = None     # selected Cob Cannon, or None when not targeting
         self._cursor_hidden = False
         self._ghost_cache = {}
+        # Scratch surfaces for particle drawing — keyed by (w, h) to avoid
+        # allocating tiny SRCALPHA surfaces every frame.
+        self._scratch_cache = {}
         # Reusable translucent layers (avoid allocating full-screen surfaces every frame)
         self._seed_bar_surface = pygame.Surface((SCREEN_WIDTH, UI_BAR_H), pygame.SRCALPHA)
         self._seed_bar_surface.fill((70, 50, 30, 230))
-        self._fog_veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        self._fog_veil.fill((180, 190, 200, 60))
+        # A flat wash, so it wants a constant alpha rather than a per-pixel one:
+        # an SRCALPHA fill makes SDL blend every pixel separately where a plain
+        # set_alpha() blends the whole surface in one pass. Measured over a full
+        # screen, 0.65 ms per frame against 0.37 ms. Same pixels either way.
+        self._fog_veil = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self._fog_veil.fill((180, 190, 200))
+        self._fog_veil.set_alpha(60)
         # placement-preview tint overlays (green ok / red blocked)
         self._preview_ok = pygame.Surface((CELL_W, CELL_H), pygame.SRCALPHA)
         self._preview_ok.fill((70, 220, 90, 70))
@@ -116,6 +124,7 @@ class Game:
         self._flash_surface.fill((255, 245, 220))
         # static background layers built per level (pool water / roof tiles)
         self._water_layer = None
+        self._water_row0 = 0
         self._roof_layer = None
         # top-bar quick buttons (fast-forward, pause) — left of the shovel
         self.btn_ff = pygame.Rect(SCREEN_WIDTH - 80 - 46, UI_BAR_Y + 14, 40, 48)
@@ -155,6 +164,11 @@ class Game:
         i18n.set_lang(lang)
         self.save.settings["lang"] = lang
         self.save.save()
+        # Cached text renders are keyed on the translated string, but the
+        # module-level caches in ui/fx survive screen rebuilds — drop them so
+        # the old language's surfaces don't linger and any screen that isn't
+        # rebuilt below (menu/mode/pause overlays) re-renders in the new one.
+        invalidate_text_caches()
         # refresh cached screen titles
         if self.state == STATE_LEVEL_SELECT:
             if getattr(self, '_survival_select', False):
@@ -173,20 +187,36 @@ class Game:
         self.roof_tiles = []
         self.fog_layers = []
         self._water_layer = None
+        self._water_row0 = 0
         self._roof_layer = None
 
         if bg_type == BG_POOL:
             # Pre-render the water lanes once (animated per-frame line drawing
             # used to cost ~60 draw calls every frame).
-            self._water_layer = pygame.Surface((GRID_W, GRID_H), pygame.SRCALPHA)
+            # Sized to just the water band rather than to the whole grid: the
+            # surface has per-pixel alpha, and an alpha blit costs roughly ten
+            # times an opaque one (measured 0.65 ms against 0.06 ms for a full
+            # grid), so every transparent row it carries is paid for on every
+            # frame while painting nothing. POOL_WATER_ROWS is contiguous today;
+            # deriving the band from min/max keeps this correct if it ever is
+            # not, at the cost of repainting the rows between two disjoint bands.
+            self._water_row0 = min(POOL_WATER_ROWS)
+            band_h = (max(POOL_WATER_ROWS) - self._water_row0 + 1) * CELL_H
+            self._water_layer = pygame.Surface((GRID_W, band_h), pygame.SRCALPHA)
             for row in POOL_WATER_ROWS:
-                y = row * CELL_H
+                y = (row - self._water_row0) * CELL_H
                 water = pygame.Rect(0, y, GRID_W, CELL_H)
                 pygame.draw.rect(self._water_layer, (48, 130, 190), water)
                 for line_y in range(y + 12, y + CELL_H, 22):
                     pygame.draw.line(self._water_layer, (110, 195, 225),
                                      (4, line_y), (GRID_W - 4, line_y), 2)
                 pygame.draw.rect(self._water_layer, (25, 92, 145), water, 3)
+
+        # Tell the battlefield-intel singleton which rows are open water so
+        # the Director's row picks, bungee drops and tactician transfers never
+        # send a ground zombie onto a lane it cannot swim.
+        ai.intel.water_rows = (frozenset(POOL_WATER_ROWS)
+                               if bg_type == BG_POOL else frozenset())
 
         if bg_type == BG_ROOF:
             # one visible roof tile per playable cell, pre-rendered as a layer
@@ -203,7 +233,13 @@ class Game:
                                      (x, y + CELL_H - 2), (x + CELL_W, y + CELL_H - 2), 3)
                     pygame.draw.line(layer, (115, 44, 37),
                                      (x + CELL_W - 2, y), (x + CELL_W - 2, y + CELL_H), 2)
-            self._roof_layer = layer
+            # Every cell paints an opaque rect, so the layer's alpha channel is
+            # uniformly 255 and never consulted — but an SRCALPHA blit still
+            # goes through the per-pixel alpha path. convert() drops the channel
+            # and takes the blit from 0.65 ms to 0.06 ms. If a future roof
+            # decoration wants to show the lawn through a gap, this has to go
+            # back to convert_alpha().
+            self._roof_layer = layer.convert()
             for row in range(GRID_ROWS):
                 for col in range(GRID_COLS):
                     x = GRID_X + col * CELL_W
@@ -237,12 +273,62 @@ class Game:
         self.wave.waves = wave_config
         self.wave.wave_count = len(wave_config)
 
+    def _preload_level_sprites(self):
+        """Warm the body-sprite cache for everything this level can spawn.
+
+        The cache is keyed per (sheet, frame, height), so any animation cell
+        that has not been drawn yet costs a scale2x plus a smoothscale the
+        first time it appears. Doing it here, during the level fade-in, moves
+        the whole cost off the critical path.
+
+        Only the sheets this level can actually field are warmed, so an early
+        level does not pay for the elite variants it will never spawn.
+        """
+        sheets = ("anim_zombie_a", "anim_zombie_b")
+        prefixes = [f"{s}_{state}" for s in sheets
+                    for state in ("idle", "eat", "die")]
+        # Elite skins only exist once the Director has unlocked them.
+        tints = AI_ZOMBIE_TINTS if self.wave._ai_unlocked() else ()
+        assets_loader.preload(prefixes, ZOMBIE_BODY_H, tints)
+        # Suns spin through a 24-step rotation set over their lifetime; the
+        # same argument as above applies to each step, just spread thin.
+        assets_loader.preload_rotations("ui_sun", SUN_SPRITE_SIZE,
+                                       SUN_SPRITE_SIZE)
+
     def _open_adventure_map(self):
         """Refresh the adventure map with the current unlock state."""
         self.unlocked_levels = derive_unlocked(self.completed_levels)
         self.level_select.set_items(ADVENTURE_LEVELS, tr("Adventure Mode"),
                                     unlocked_ids=self.unlocked_levels)
         self.state = STATE_LEVEL_SELECT
+
+    def _reset_game_state(self, start_sun=150):
+        """Reset all gameplay lists and timers to a clean state for a new level."""
+        self.speed_mult = 1.0
+        self._press = None
+        self._cob_armed = None
+        self.plant_foods = []
+        self.plant_food = 0
+        self.food_timer = random.uniform(11.0, 18.0)
+        self.fx.clear()
+        self.coin_drops = []
+        self.grid = Grid()
+        self.plants = []
+        self.zombies = []
+        self.projectiles = []
+        self.suns = []
+        self.lawnmowers = []
+        self.sun_value = start_sun
+        self.house_hp = HOUSE_HP
+        self.plant_cooldowns = {}
+        self.sun_spawn_timer = 0.0
+        # Also clear any leftover FX from a previous game
+        self.floating_texts = []
+        self.explosions = []
+        self.fx.clear()
+        self.shake = 0.0
+        self.flash_timer = 0.0
+        self._zoom_freeze = 0.0
 
     def start_adventure_level(self, level_id, picked_plants=None):
         """Start a specific adventure level.
@@ -262,27 +348,7 @@ class Game:
         self.current_level = level
         self.level_id = level_id
         self.bg_type = level["bg"]
-        self.speed_mult = 1.0
-        self._press = None
-        self.plant_foods = []
-        self.plant_food = 0
-        self.food_timer = random.uniform(11.0, 18.0)
-        self.food_rings = []
-        self.boss_aura = []
-        self.grass_prints = []
-        self.coin_drops = []
-
-        # reset game state
-        self.grid = Grid()
-        self.plants = []
-        self.zombies = []
-        self.projectiles = []
-        self.suns = []
-        self.lawnmowers = []
-        self.sun_value = level["start_sun"]
-        self.house_hp = HOUSE_HP
-        self.plant_cooldowns = {}
-        self.sun_spawn_timer = 0.0
+        self._reset_game_state(start_sun=level["start_sun"])
 
         # setup background first because roof mode changes grid.y
         self._setup_background(level["bg"])
@@ -297,6 +363,10 @@ class Game:
         self._setup_waves(level["waves"])
         self.wave.grid_y = self.grid.y
         self.wave.scaling = False  # adventure keeps authored difficulty
+
+        # Build the sprite variants this level can field now, while the level
+        # is still fading in, rather than the first time each one is drawn.
+        self._preload_level_sprites()
 
         # shovel
         self.shovel = Shovel()
@@ -325,27 +395,7 @@ class Game:
         self.level_id = survival_id
         self.bg_type = mode["bg"]
         self.survival_waves = 0
-        self.speed_mult = 1.0
-        self._press = None
-        self.plant_foods = []
-        self.plant_food = 0
-        self.food_timer = random.uniform(11.0, 18.0)
-        self.food_rings = []
-        self.boss_aura = []
-        self.grass_prints = []
-        self.coin_drops = []
-
-        # reset game state
-        self.grid = Grid()
-        self.plants = []
-        self.zombies = []
-        self.projectiles = []
-        self.suns = []
-        self.lawnmowers = []
-        self.sun_value = 150
-        self.house_hp = HOUSE_HP
-        self.plant_cooldowns = {}
-        self.sun_spawn_timer = 0.0
+        self._reset_game_state(start_sun=150)
 
         # setup background first because roof mode changes grid.y
         self._setup_background(mode["bg"])
@@ -426,6 +476,11 @@ class Game:
         if event.type == pygame.WINDOWFOCUSLOST and self.state == STATE_PLAYING:
             self.state = STATE_PAUSED
             self._press = None  # a half-finished card drag must not fire on resume
+            self._cob_armed = None
+            # _refresh_cursor only runs in the PLAYING branch of update();
+            # without this the OS cursor stays hidden on the pause screen
+            # when a seed card / shovel was selected.
+            self._refresh_cursor()
             return
 
         # M toggles sound from anywhere
@@ -591,6 +646,8 @@ class Game:
             if event.key == pygame.K_p:
                 self.state = STATE_PAUSED
                 self._press = None
+                self._cob_armed = None
+                self._refresh_cursor()
             elif event.key == pygame.K_f:
                 # fast-forward toggle (also clickable in the top bar)
                 self.speed_mult = 2.0 if self.speed_mult == 1.0 else 1.0
@@ -659,11 +716,22 @@ class Game:
 
             # check sun collection (collected suns are already flying to the jar)
             for sun in self.suns[:]:
-                if not sun.collected and sun.rect().collidepoint(mx, my):
+                if sun.contains(mx, my):
                     sun.collect((SUN_JAR_X + SUN_JAR_W // 2, SUN_JAR_Y + SUN_JAR_W // 2))
                     self._spawn_collect_text(int(sun.x), int(sun.y) - 8, sun.amount)
                     self._play_sound(SOUND_SUN_COLLECT, 0.5)
                     return
+
+            # Cob Cannon uses the original two-step interaction: click the
+            # cannon to arm it, then click a lawn cell to choose the target.
+            if not any(btn.selected for btn in self.seed_buttons) and not (self.shovel and self.shovel.selected):
+                for cob in self.plants:
+                    if (cob.alive and getattr(cob, "plant_type", "") == PLANT_COBCANNON
+                            and pygame.Rect(cob.x, cob.y, cob.w, cob.h).collidepoint(mx, my)):
+                        self._cob_armed = None if self._cob_armed is cob else cob
+                        self.message.show(tr("Cob Cannon armed — choose a target!") if self._cob_armed is cob
+                                          else tr("Cob Cannon cancelled"), 1200)
+                        return
 
             # shovel: click cell to dig up plant
             if self.shovel and self.shovel.selected:
@@ -678,17 +746,21 @@ class Game:
             # ---- Cob Cannon: tap any lawn cell to fire a KernelBomb arc ----
             # If a CobCannon exists on the lawn, the click is consumed as a
             # targeting shot before falling through to normal plant handling.
-            if cell:
-                cob = self._first_cob_cannon()
-                if cob is not None and cob.ready:
+            has_selected_seed = any(btn.selected for btn in self.seed_buttons)
+            if cell and self._cob_armed is not None and not has_selected_seed and not (self.shovel and self.shovel.selected):
+                cob = self._cob_armed
+                if cob.alive and cob.ready:
                     proj = cob.fire_at(int(mx), int(my))
                     if proj is not None:
                         self.projectiles.append(proj)
                         self._play_sound("cannon", 0.6)
-                        self._spawn_collect_text(int(mx), int(my) - 16,
-                                                 "FIRE!", color=(255, 80, 60),
-                                                 size=18, vy=-50, lifetime=0.8)
+                        self.floating_texts.append(FloatingText(
+                            int(mx), int(my) - 16, tr("FIRE!"),
+                            color=(255, 80, 60), size=18, vy=-50, lifetime=0.8))
+                        self._cob_armed = None
                         return  # don't fall through to plant on this click
+                self._cob_armed = None
+                self.message.show(tr("Cob Cannon is reloading!"), 900)
 
             if cell:
                 selected = None
@@ -830,7 +902,7 @@ class Game:
             for btn in self.seed_buttons:
                 if btn.plant_type == plant_type:
                     btn.selected = False
-            self.plant_poof.append({"x": cx, "y": cy, "age": 0, "max": 0.3})
+            self.fx.soil_poof(cx, cy)
             self.floating_texts.append(FloatingText(
                 int(cx), int(cy) - 40, i18n.fmt_level_up(target.level),
                 color=(130, 255, 130), size=24, vy=-45, lifetime=1.2))
@@ -849,7 +921,7 @@ class Game:
             if btn.plant_type == plant_type:
                 btn.selected = False
         # soil poof effect at plant position
-        self.plant_poof.append({"x": cx, "y": cy, "age": 0, "max": 0.3})
+        self.fx.soil_poof(cx, cy)
         self._play_sound(SOUND_PLANT)
         return True
 
@@ -875,7 +947,7 @@ class Game:
             target = in_cell[0]  # only a lily pad here
         target.alive = False
         self._play_sound("shovel", 0.7)
-        self.plant_poof.append({"x": cx, "y": cy, "age": 0, "max": 0.25})
+        self.fx.soil_poof(cx, cy)
         if self.shovel:
             self.shovel.selected = False
 
@@ -890,25 +962,20 @@ class Game:
         self.floating_texts.append(FloatingText(
             cx, cy, tr("Plant food!"), color=(130, 255, 130),
             size=20, vy=-55, lifetime=1.1))
-        self.plant_poof.append({"x": p.x + p.w // 2, "y": p.y + p.h // 2,
-                                "age": 0, "max": 0.35})
-        # PvZ2-style plant food release: 2 expanding green rings radiating outward
+        pcx, pcy = p.x + p.w // 2, p.y + p.h // 2
+        self.fx.soil_poof(pcx, pcy)
+        # PvZ2-style plant food release: two staggered mint-green rings.
         for k in range(2):
-            self.food_rings.append({
-                "x": p.x + p.w // 2, "y": p.y + p.h // 2,
-                "age": -k * 0.10,            # staggered start
-                "max": 0.55,                 # 0.55s lifetime
-                "r0": 18, "r1": 110,         # expands from 18px to 110px
-                "color": (130, 255, 160),    # mint-green glow
-            })
+            self.fx.ring(pcx, pcy, 18, 110, (130, 255, 160),
+                         duration=0.55, delay=k * 0.10, width=3)
         if p.plant_type == PLANT_PEASHOOTER:
             p.food_boost = FOOD_BOOST_SHOOT_S  # machine-gun peas
         elif p.plant_type == PLANT_SUNFLOWER:
             for _ in range(FOOD_SUN_BURST):
                 sun = Sun(p.x + random.randint(-20, 70), p.y - 20)
                 sun.amount = 25
-                sun.target_y = p.y + random.randint(-8, 24)
-                sun.falling = True
+                # Plant-food sun also arcs out of the head.
+                sun.eject(vy=-230.0, target_y=p.y + random.randint(20, 60))
                 self.suns.append(sun)
         elif p.plant_type == PLANT_WALLNUT:
             p.hp = p.max_hp  # full repair
@@ -937,12 +1004,15 @@ class Game:
             self.shovel.selected = False
         self.grid.clear_selection()
         self._press = None
+        self._cob_armed = None
 
     def _topbar_click(self, mx, my):
         """Handle the quick pause / fast-forward buttons in the top bar."""
         if self.btn_pause.collidepoint(mx, my):
             self.state = STATE_PAUSED
             self._press = None
+            self._cob_armed = None
+            self._refresh_cursor()
             self._play_sound("click", 0.5)
             return True
         if self.btn_ff.collidepoint(mx, my):
@@ -1059,6 +1129,21 @@ class Game:
 
     def _advance_after_wave(self):
         """Start the next wave or finish/extend the current mode."""
+        # Endless survival regenerates its wave table every 50 waves, so
+        # wave_idx == wave_count recurs (wave 50, 100, ...) — only adventure
+        # has a real "last wave".
+        if (self.mode == MODE_ADVENTURE
+                and self.wave.wave_index == self.wave.wave_count):
+            # On a boss wave, free-spawned minions may remain after the boss
+            # dies. Keep the level in a cleared-final-wave state until every
+            # enemy is gone.
+            if any(z.alive and z.hp > 0 for z in self.zombies):
+                self.wave.wave_active = False
+                self.wave.between_waves = False
+                self.wave.wave_cleared = True
+            else:
+                self._complete_adventure()
+            return
         if self.wave.wave_index < self.wave.wave_count:
             # Reward popup: 6 coin drops fan upward in the lawn center
             cx = GRID_X + GRID_W // 2
@@ -1084,15 +1169,6 @@ class Game:
             self._generate_survival_waves()
             if self.wave.start_wave():
                 self._announce_wave(self.wave.wave_index)
-        else:
-            # On a boss wave, free-spawned minions may remain after the boss dies.
-            # Keep the level in a cleared-final-wave state until every enemy is gone.
-            if any(z.alive and z.hp > 0 for z in self.zombies):
-                self.wave.wave_active = False
-                self.wave.between_waves = False
-                self.wave.wave_cleared = True
-            else:
-                self._complete_adventure()
 
     def _select_seed_button(self, btn):
         """Shared mouse/keyboard seed selection with affordability/cooldown checks."""
@@ -1127,6 +1203,7 @@ class Game:
         plant/zombie tooltips and highlights on the lawn."""
         self.hover_plant = None
         self.hover_zombie = None
+        self.hover_sun = None
         if my < UI_BAR_H:
             # top bar: show card info on hover
             for btn in self.seed_buttons:
@@ -1136,6 +1213,17 @@ class Game:
             if self.shovel and self.shovel.contains(mx, my):
                 self.tooltip.show(tr("Shovel: dig up a plant"), mx + 14, UI_BAR_H + 4)
                 return
+            self.tooltip.hide()
+            return
+        # Suns sit on top of everything on the lawn and are click-to-collect,
+        # so they claim the cursor first. The cell-hover wash is suppressed
+        # underneath (阳光卡在两块草地中间时半边被刷白、看起来被"分隔开"的根源)
+        # and the sun itself gets a pickup ring so the click target reads.
+        for sun in self.suns:
+            if sun.alive and sun.contains(mx, my):
+                self.hover_sun = sun
+                break
+        if self.hover_sun is not None:
             self.tooltip.hide()
             return
         # plants
@@ -1177,12 +1265,7 @@ class Game:
         self.floating_texts.append(FloatingText(x, y, f"+{int(amount)}", color=COLOR_YELLOW, size=18, vy=-50, lifetime=0.9))
 
     def _spawn_plant_debris(self, plant):
-        """Burst 8 small petal/leaf particles when a plant is eaten.
-        Each debris is [x, y, vx, vy, color, age, lifetime]."""
-        # Tint palette per plant type — keeps the burst on-theme
-        from constants import (PLANT_PEASHOOTER, PLANT_SUNFLOWER,
-                               PLANT_WALLNUT, PLANT_CHERRYBOMB,
-                               PLANT_FUMESHROOM, PLANT_LILYPAD)
+        """Burst of petals/leaves when a plant is eaten, tinted per species."""
         palette = {
             PLANT_PEASHOOTER:   [(60, 170, 70), (110, 200, 90), (40, 130, 50)],
             PLANT_SUNFLOWER:    [(255, 215, 60), (255, 245, 160), (220, 150, 30)],
@@ -1190,130 +1273,31 @@ class Game:
             PLANT_CHERRYBOMB:   [(220, 30, 30), (255, 100, 80), (160, 20, 20)],
             PLANT_FUMESHROOM:   [(160, 60, 200), (200, 120, 255), (100, 30, 150)],
             PLANT_LILYPAD:      [(60, 170, 70), (110, 200, 90), (40, 130, 50)],
+            PLANT_SNOWPEA:      [(120, 210, 255), (200, 240, 255), (60, 150, 210)],
         }.get(plant.plant_type, [(255, 255, 255)])
-        cx = int(plant.x + plant.w // 2)
-        cy = int(plant.y + plant.h // 2)
-        import random as _r
-        for _ in range(8):
-            ang = _r.uniform(-math.pi * 0.85, -math.pi * 0.15)  # upward fan
-            spd = _r.uniform(110, 230)
-            self.plant_debris.append([
-                float(cx), float(cy),
-                math.cos(ang) * spd,
-                math.sin(ang) * spd,
-                _r.choice(palette),
-                0.0,
-                _r.uniform(0.55, 0.85),
-            ])
+        self.fx.plant_debris(plant.x + plant.w // 2, plant.y + plant.h // 2,
+                             palette=palette)
 
     def _spawn_pea_impact(self, x, y, is_fume=False, is_frost=False):
-        """Spark burst when a pea/fume/frost projectile hits a zombie.
-        Each entry is [x, y, vx, vy, color, age, lifetime]."""
-        # Fume = purple shards, pea = green shards, frost = cyan shards.
-        import random as _r
-        if is_fume:
-            shard_colors = [(180, 0, 255), (215, 140, 255)]
-        elif is_frost:
-            shard_colors = [(140, 220, 255), (220, 245, 255), (90, 180, 230)]
-        else:
-            shard_colors = [(115, 215, 35), (255, 235, 60)]
-        # 4 colored shards (fast, decay quickly)
-        for _ in range(4):
-            ang = _r.uniform(0, math.tau)
-            spd = _r.uniform(90, 200)
-            self.pea_impact.append([
-                float(x), float(y),
-                math.cos(ang) * spd, math.sin(ang) * spd,
-                _r.choice(shard_colors),
-                0.0, 0.22,
-            ])
-        # 1 white center spark that stays bigger but fades
-        center_color = (240, 250, 255) if is_frost else (255, 255, 240)
-        self.pea_impact.append([
-            float(x), float(y), 0.0, 0.0,
-            center_color,
-            0.0, 0.18,
-        ])
+        """Spark burst when a pea/fume/frost projectile hits a zombie."""
+        self.fx.pea_impact(x, y, is_fume=is_fume, is_frost=is_frost)
 
     def _spawn_balloon_pop(self, zombie):
-        """Spawn red balloon-shard burst when a Balloon Zombie pops.
-        Each entry is [x, y, vx, vy, color, age, lifetime]."""
-        import random as _r
-        # Position the burst where the balloon was — slightly above the head.
-        cx = int(zombie.x + zombie.w // 2)
-        cy = int(zombie.y - 24)
-        palette = [(220, 50, 50), (255, 110, 80), (180, 30, 30), (255, 200, 200)]
-        # 8 red rubber shreds flying out in every direction
-        for _ in range(8):
-            ang = _r.uniform(0, math.tau)
-            spd = _r.uniform(140, 280)
-            self.balloon_pop.append([
-                float(cx), float(cy),
-                math.cos(ang) * spd, math.sin(ang) * spd,
-                _r.choice(palette),
-                0.0,
-                _r.uniform(0.45, 0.7),
-            ])
-        # 1 white center flash that stays a touch longer than the shards
-        self.balloon_pop.append([
-            float(cx), float(cy), 0.0, 0.0,
-            (255, 255, 240),
-            0.0, 0.35,
-        ])
+        """Red rubber shreds where the balloon was — slightly above the head."""
+        self.fx.balloon_pop(zombie.x + zombie.w // 2, zombie.y - 24)
 
     def _spawn_mow_dust(self, mower, big=False):
-        """Emit a small puff of grey dust trailing the lawnmower.
-        Each entry is [x, y, vx, vy, color, age, lifetime]."""
-        import random as _r
-        # Dust puffs out behind the mower (its left side, since it travels
-        # rightward) and slightly up so it hangs in the air.
-        cx = int(mower.x - 4)
-        cy = int(mower.y + _r.randint(8, mower.h - 6))
-        n = 4 if big else 2
-        for _ in range(n):
-            ang = _r.uniform(math.pi * 0.8, math.pi * 1.4)  # left + upward fan
-            spd = _r.uniform(35, 95)
-            self.mow_dust.append([
-                float(cx + _r.randint(-6, 6)),
-                float(cy + _r.randint(-4, 4)),
-                math.cos(ang) * spd,
-                math.sin(ang) * spd,
-                (200, 195, 185),
-                0.0,
-                _r.uniform(0.5, 0.9),
-            ])
+        """Grey dust puff trailing behind the mower (it travels rightward)."""
+        # The emitter fans leftward; `big` is a wider burst for a fresh start.
+        self.fx.mow_dust(mower.x - 4, mower.y + mower.h * 0.5, big=big)
 
     def _spawn_minion_landing(self, zombie):
-        """Visual a boss-summoned minion landing on the lawn.
-        Emits:
-        - 1 expanding white→yellow ring (the impact wave)
-        - 5 brown dust puffs radiating outward
-        - small screen shake
-        """
-        cx = int(zombie.x + zombie.w // 2)
-        cy = int(zombie.y + zombie.h - 8)
-        # 1) expanding ring — uses the existing boss_aura system (sparks=False)
-        self.boss_aura.append({
-            "x": cx, "y": cy, "age": 0, "max": 0.45,
-            "r0": 12, "r1": 70,
-            "color": (255, 230, 120),    # warm yellow shockwave
-            "phase": "minion_land",
-        })
-        # 2) dust puffs — reuse mow_dust style
-        import random as _r
-        import math as _m
-        for _ in range(5):
-            ang = _r.uniform(_m.pi * 0.8, _m.pi * 1.4)
-            spd = _r.uniform(45, 110)
-            self.mow_dust.append([
-                float(cx + _r.randint(-6, 6)),
-                float(cy + _r.randint(-4, 4)),
-                _m.cos(ang) * spd,
-                _m.sin(ang) * spd,
-                (175, 145, 90),    # brown dust tint
-                0.0,
-                _r.uniform(0.5, 0.8),
-            ])
+        """Impact wave + dust where a boss-summoned minion touches down."""
+        cx = zombie.x + zombie.w // 2
+        cy = zombie.y + zombie.h - 8
+        self.fx.ring(cx, cy, 12, 70, (255, 230, 120), duration=0.45, width=4)
+        self.fx.burst(cx, cy, (175, 145, 90), n=6, speed=(45, 110),
+                      size=(3, 7), life=(0.5, 0.8), gravity=180, kind="puff")
         self.add_shake(3)
 
     def _chain_trigger_mowers(self, exclude_row=None):
@@ -1336,51 +1320,110 @@ class Game:
             self.add_shake(min(8, 2 + triggered))
 
     def _spawn_zombie_head(self, zombie):
-        """Spawn 1-2 'limb' sprites flying off when a zombie dies.
-        Each entry is [x, y, vx, vy, color, age, lifetime]."""
-        import random as _r
-        # Conehead / Buckethead / Flag drop a tiny piece of equipment;
-        # basic / newspaper drop their signature item (cone/bucket/flag/paper).
-        from constants import (ZOMBIE_BASIC, ZOMBIE_CONEHEAD,
-                               ZOMBIE_BUCKETHEAD, ZOMBIE_FLAG,
-                               ZOMBIE_NEWSPAPER)
+        """Chunks of gear/gore flung off when a zombie dies.
+
+        Conehead/Buckethead/Flag/Newspaper shed their signature equipment in
+        its own colour; a basic zombie just throws a grey shoulder knob, so
+        ordinary deaths don't turn the lawn into confetti.
+        """
         palette = {
             ZOMBIE_CONEHEAD:   (230, 112, 28),    # orange cone
             ZOMBIE_BUCKETHEAD: (160, 168, 175),   # metal bucket
             ZOMBIE_FLAG:       (210, 35, 35),     # red flag
             ZOMBIE_NEWSPAPER:  (235, 232, 220),   # off-white news
+            ZOMBIE_TACTICIAN:  (168, 138, 240),   # AI: violet sash
+            ZOMBIE_DIGGER:     (196, 150, 90),    # AI: work gloves
+            ZOMBIE_HEALER:     (140, 235, 190),   # AI: apothecary green
+            ZOMBIE_COMMANDER:  (255, 196, 90),    # AI: officer gold
         }
-        chunk_color = palette.get(zombie.zombie_type, (90, 90, 95))
-        # Conehead/Buckethead/Flag/Newspaper drop 3 chunks (visible equipment);
-        # basic zombies only get 1 chunk (a shoulder knob — keeps the list small).
-        n_chunks = 3 if zombie.zombie_type in palette else 1
-        cx = int(zombie.x + zombie.w // 2)
-        cy = int(zombie.y + 16)
-        for _ in range(n_chunks):
-            ang = _r.uniform(-math.pi * 0.85, -math.pi * 0.15)
-            spd = _r.uniform(80, 200)
-            self.zombie_heads.append([
-                float(cx + _r.randint(-20, 20)),
-                float(cy + _r.randint(-10, 10)),
-                math.cos(ang) * spd * 0.4,
-                math.sin(ang) * spd,
-                chunk_color,
-                0.0,
-                _r.uniform(0.7, 1.0),
-            ])
+        color = palette.get(zombie.zombie_type, (90, 90, 95))
+        n = 3 if zombie.zombie_type in palette else 1
+        cx = zombie.x + zombie.w // 2
+        cy = zombie.y + 16
+        for _ in range(n):
+            ang = random.uniform(-math.pi * 0.85, -math.pi * 0.15)
+            spd = random.uniform(80, 200)
+            self.fx._emit(x=cx + random.randint(-20, 20),
+                          y=cy + random.randint(-10, 10),
+                          vx=math.cos(ang) * spd * 0.4,
+                          vy=math.sin(ang) * spd,
+                          gravity=480, drag=0.35,
+                          size=random.uniform(3, 5.5),
+                          max_life=random.uniform(0.7, 1.0),
+                          color=color, kind="chunk")
 
     def _spawn_grass_print(self, zombie):
-        """Drop a faint brown footprint ellipse below the zombie's feet.
-        Each entry: {"x","y","age","max","w","h"} — no physics, just fade.
+        """Faint pressed-grass footprint below the zombie's feet."""
+        self.fx.grass_print(zombie.x + zombie.w // 2 + random.randint(-3, 3),
+                            zombie.y + zombie.h - 6)
+
+    def _consume_zombie_ai_fx(self, z):
+        """Drain the FX flags an AI zombie set during its update.
+
+        ``entities.py`` deliberately knows nothing about the particle system —
+        it just records intent (``_beam_pending``, ``_hop_pending``,
+        ``_dig_dust_pending`` …) and the game translates that into effects
+        once per frame. Keeps the zombie logic unit-testable and free of
+        pygame draw calls.
         """
-        self.grass_prints.append({
-            "x": int(zombie.x + zombie.w // 2 + random.randint(-3, 3)),
-            "y": int(zombie.y + zombie.h - 6),
-            "age": 0.0,
-            "max": 1.4,            # 1.4s lifetime — short, just a step hint
-            "w": 14,
-            "h": 4,
-        })
+        beam = z._beam_pending
+        if beam is not None:
+            z._beam_pending = None
+            target, kind = beam
+            hx = z.x + z.w // 2
+            hy = z.y + 14
+            if kind == "heal" and target is not None:
+                self.fx.beam(hx, hy, target.x + target.w // 2, target.y + 14,
+                             (140, 250, 190), duration=0.45, width=3)
+                # A soft green motes drift up off the mended zombie.
+                self.fx.burst(target.x + target.w // 2, target.y + 14,
+                              (150, 255, 200), n=5, speed=(20, 70),
+                              size=(2, 3.6), life=(0.35, 0.6), gravity=-40)
+                self.fx.ring(target.x + target.w // 2, target.y + 16,
+                             4, 26, (140, 250, 190), duration=0.4, width=2)
+            elif kind == "rally":
+                self.fx.ring(hx, hy, 12, COMMANDER_RANGE,
+                             (255, 208, 120), duration=0.6, width=3)
+                self.fx.burst(hx, hy, (255, 226, 150), n=8, speed=(70, 190),
+                              size=(2, 4), life=(0.4, 0.7), gravity=120)
+
+        hop = z._hop_pending
+        if hop is not None:
+            z._hop_pending = None
+            hx, y0, y1 = hop
+            self.fx.hop_trail(hx, y0, y1, hx)
+            self.fx.ring(hx, y1 + 16, 4, 30, (168, 138, 240),
+                         duration=0.4, width=2, layer=0)
+
+        if getattr(z, "_dig_dust_pending", False):
+            z._dig_dust_pending = False
+            self.fx.dig_dust(z.x + z.w // 2, z.y + z.h - 6)
+
+        if getattr(z, "_emerge_pending", False):
+            z._emerge_pending = False
+            ex, ey = z.x + z.w // 2, z.y + z.h - 6
+            self.fx.dig_dust(ex, ey)
+            self.fx.ring(ex, ey, 4, 40, (150, 116, 66),
+                         duration=0.45, width=3, layer=0)
+            self.add_shake(2)
+
+        # Bungee reaches the plant: yellow lift-up dust right before the snatch.
+        if getattr(z, "_steal_burst_pending", False):
+            z._steal_burst_pending = False
+            cx, cy = z.x + z.w // 2, z.y + z.h - 10
+            self.fx.burst(cx, cy, (240, 220, 120), n=8, speed=(40, 120),
+                          size=(2, 4), life=(0.3, 0.6), gravity=300)
+            self.fx.ring(cx, cy, 4, 30, (255, 230, 140),
+                         duration=0.35, width=2)
+
+        # Newspaper zombie's paper finally gave out — red anger flare + groan.
+        if getattr(z, "_play_anger", False):
+            z._play_anger = False
+            cx, cy = z.x + z.w // 2, z.y + 14
+            self.fx.burst(cx, cy, (220, 60, 50), n=10, speed=(60, 180),
+                          size=(2, 4), life=(0.35, 0.6), gravity=120)
+            self.fx.ring(cx, cy, 6, 40, (230, 70, 60), duration=0.4, width=3)
+            self._play_sound("groan", 0.9)
 
     def _spawn_coin_drop(self, x, y, value=25):
         """Gold coin popup that arcs up + falls back. Used as a wave-clear /
@@ -1423,66 +1466,51 @@ class Game:
         self._play_sound("explode", 0.8)
 
     def _spawn_boss_aura(self, boss, kind="summon"):
-        """Emit a halo + sparks at the boss when it summons a minion (kind='summon')
-        or when the boss itself dies (kind='death'). Each entry:
-            {"x", "y", "age", "max", "r0", "r1", "color", "phase", "sparks": [...]}
-        Sparks are baked at spawn time so we don't have to live-track boss pos.
+        """A halo + sparks at the boss on a summon, or a shockwave on death.
+
+        Sparks are emitted at the boss's *current* position rather than being
+        baked as a live-tracked entity, so a walking boss doesn't drag them.
         """
-        import random as _r
-        cx = int(boss.x + boss.w // 2)
-        cy = int(boss.y + 18)
+        cx = boss.x + boss.w // 2
+        cy = boss.y + 18
         if kind == "summon":
-            # Magenta summon halo + 3 upward sparks (signals a minion is coming)
-            self.boss_aura.append({
-                "x": cx, "y": cy, "age": 0, "max": 0.55,
-                "r0": 16, "r1": 80,
-                "color": (200, 80, 230),    # magenta-purple
-                "phase": "summon",
-            })
-            for _ in range(3):
-                ang = _r.uniform(-math.pi * 0.85, -math.pi * 0.15)
-                spd = _r.uniform(60, 110)
-                self.boss_aura.append({
-                    "spark": True,
-                    "x": float(cx + _r.randint(-10, 10)),
-                    "y": float(cy + _r.randint(-6, 6)),
-                    "vx": math.cos(ang) * spd * 0.4,
-                    "vy": math.sin(ang) * spd - 30,
-                    "color": (220, 130, 255),
-                    "age": 0.0,
-                    "max": _r.uniform(0.5, 0.8),
-                })
+            # Magenta halo + upward sparks: a minion is inbound.
+            self.fx.ring(cx, cy, 16, 80, (200, 80, 230), duration=0.55, width=4)
+            for _ in range(4):
+                ang = random.uniform(-math.pi * 0.85, -math.pi * 0.15)
+                spd = random.uniform(60, 130)
+                self.fx._emit(x=cx + random.randint(-10, 10),
+                              y=cy + random.randint(-6, 6),
+                              vx=math.cos(ang) * spd * 0.4,
+                              vy=math.sin(ang) * spd - 30,
+                              gravity=260, drag=1.5,
+                              size=random.uniform(2, 4),
+                              max_life=random.uniform(0.5, 0.8),
+                              color=(220, 130, 255), kind="dot")
         elif kind == "death":
-            # Two big concentric shockwaves, white→magenta, staggered
-            for i, (delay, r0, r1, color) in enumerate([
-                (0.00, 24, 220, (255, 255, 255)),  # bright white
-                (0.10, 24, 200, (220, 80, 240)),   # magenta core
-            ]):
-                self.boss_aura.append({
-                    "x": cx, "y": cy,
-                    "age": -delay, "max": 0.9,
-                    "r0": r0, "r1": r1,
-                    "color": color,
-                    "phase": "death",
-                })
-            # Burst of 12 white/magenta sparks radiating outward in a full circle
-            for _ in range(12):
-                ang = _r.uniform(0, math.tau)
-                spd = _r.uniform(140, 240)
-                is_mag = _r.random() < 0.5
-                self.boss_aura.append({
-                    "spark": True,
-                    "x": float(cx + _r.randint(-12, 12)),
-                    "y": float(cy + _r.randint(-8, 8)),
-                    "vx": math.cos(ang) * spd,
-                    "vy": math.sin(ang) * spd - 30,
-                    "color": (255, 200, 255) if is_mag else (240, 240, 255),
-                    "age": 0.0,
-                    "max": _r.uniform(0.7, 1.0),
-                })
+            # Two staggered shockwaves: a bright white flash then a magenta core.
+            self.fx.ring(cx, cy, 24, 220, (255, 255, 255), duration=0.9, width=5)
+            self.fx.ring(cx, cy, 24, 200, (220, 80, 240), duration=0.9, width=5,
+                         delay=0.10)
+            # Full-circle spray of white/magenta embers.
+            for _ in range(14):
+                ang = random.uniform(0, math.tau)
+                spd = random.uniform(140, 240)
+                self.fx._emit(x=cx + random.randint(-12, 12),
+                              y=cy + random.randint(-8, 8),
+                              vx=math.cos(ang) * spd,
+                              vy=math.sin(ang) * spd - 30,
+                              gravity=260, drag=1.5,
+                              size=random.uniform(2, 5),
+                              max_life=random.uniform(0.7, 1.0),
+                              color=(255, 200, 255) if random.random() < 0.5
+                              else (240, 240, 255), kind="dot")
 
     def _announce_wave(self, wave_idx):
-        if wave_idx == self.wave.wave_count:
+        # Endless survival regenerates its wave table every 50 waves, so
+        # wave_idx == wave_count recurs (wave 50, 100, ...) — only adventure
+        # has a real "last wave".
+        if self.mode == MODE_ADVENTURE and wave_idx == self.wave.wave_count:
             self.wave_warning.show(tr("FINAL WAVE!"), tr("Brace yourself!"), COLOR_RED, 3.5)
             self._play_sound("bigwave")
             self._zoom_freeze = 0.55   # longest zoom for final
@@ -1503,7 +1531,7 @@ class Game:
         if (self.bg_type in (BG_FOG, BG_ROOF) and self.mode == MODE_ADVENTURE
                 and (wave_idx % 5 == 0 or wave_idx == self.wave.wave_count)):
             col = random.randint(1, GRID_COLS - 1)
-            row = random.randint(0, GRID_ROWS - 1)
+            row = random.choice(ai.intel.land_rows())
             z = create_zombie(GRID_X + col * CELL_W + (CELL_W - 90) // 2,
                               -250, row, ZOMBIE_BUNGEE)
             z.grid_y = self.grid.y
@@ -1513,15 +1541,24 @@ class Game:
     def announce_cherry_explosion(self, x, y, zombies_killed):
         """Big floating text for cherry bomb kills."""
         if zombies_killed > 0:
-            txt = f"BOOM! -{zombies_killed}" if zombies_killed > 1 else "BOOM!"
+            txt = (tr("BOOM!") + f" -{zombies_killed}") if zombies_killed > 1 else tr("BOOM!")
             color = COLOR_RED
         else:
-            txt = "*fizzle*"
+            txt = tr("*fizzle*")
             color = (180, 180, 180)
         self.floating_texts.append(FloatingText(x, y, txt, color=color, size=28, vy=-80, lifetime=1.4))
 
     def update(self, dt):
+        # Decay feel timers in real time, before the state check: main.py
+        # applies shake_offset() unconditionally, so if a state change
+        # (game over / victory / pause) lands while shake or flash is
+        # non-zero, the end screen would otherwise shake/flash forever.
+        self.shake = max(0.0, self.shake - 26.0 * dt)
+        self.sun_pulse = max(0.0, self.sun_pulse - 2.2 * dt)
+        self.flash_timer = max(0.0, self.flash_timer - dt)
         if self.state != STATE_PLAYING:
+            if self.state in (STATE_LEVEL_COMPLETE, STATE_SURVIVAL_COMPLETE):
+                self._update_coin_drops(dt)
             return
 
         # Fast-forward scales the whole simulation uniformly.
@@ -1530,11 +1567,6 @@ class Game:
         # signals the "time freeze" feel. We deliberately do NOT slow dt here,
         # because gameplay-critical timers (bungee descent, cherry fuse, plant
         # food) need real-time progression to keep their mechanics intact.
-
-        # decay feel timers
-        self.shake = max(0.0, self.shake - 26.0 * dt)
-        self.sun_pulse = max(0.0, self.sun_pulse - 2.2 * dt)
-        self.flash_timer = max(0.0, self.flash_timer - dt)
 
         # ambient zombie groans while the horde is on the lawn
         if any(z.alive and z.hp > 0 and z.dying_timer <= 0 for z in self.zombies):
@@ -1558,21 +1590,30 @@ class Game:
                     target_y = random.randint(self.grid.y + 20,
                                               self.grid.y + GRID_H - 40)
                     sun = Sun(x, y)
-                    sun.target_y = target_y
+                    # Sky sun: gravity-accelerated fall + a couple of
+                    # rebounds when it hits the lawn (see entities._Pickup).
+                    sun.drop_from_sky(target_y)
                     self.suns.append(sun)
 
         # update suns — collected ones fly into the jar and credit on arrival
-        for sun in self.suns[:]:
-            was_falling = sun.falling
-            sun.update(dt)
-            if was_falling and not sun.falling and not sun.collected:
+        for sun in self.suns:
+            # Hovering suspends the sun's motion (entities.Sun.update): the
+            # one-frame lag vs _update_hover is imperceptible on a 2px bob.
+            sun.update(dt, hovered=(sun is self.hover_sun))
+            # First touchdown: a soft dust ring so the landing has weight.
+            if sun._landed_pending:
+                sun._landed_pending = False
+                self.fx.ring(sun.x, sun.y + 12, 6, 30, (255, 236, 150),
+                             duration=0.34, width=2, layer=0)
+                self.fx.burst(sun.x, sun.y + 12, (255, 228, 140), n=6,
+                              speed=(40, 120), size=(2, 3.6), life=(0.25, 0.45),
+                              gravity=260)
                 self._play_sound("sun_land", 0.25)
             if getattr(sun, "arrived", False):
                 sun.arrived = False
                 self.sun_value += sun.amount
                 self.sun_pulse = 1.0
-            if not sun.alive:
-                self.suns.remove(sun)
+        self.suns = [s for s in self.suns if s.alive]
 
         # plant food (能量豆) sky drops — day and night alike
         self.food_timer -= dt
@@ -1581,17 +1622,17 @@ class Game:
             if len(self.plant_foods) < 2:
                 pf = PlantFood(random.randint(GRID_X + 40, GRID_X + GRID_W - 40),
                                SUN_FALL_Y)
-                pf.target_y = random.randint(self.grid.y + 40, self.grid.y + GRID_H - 60)
+                pf.drop_from_sky(random.randint(self.grid.y + 40,
+                                                self.grid.y + GRID_H - 60))
                 self.plant_foods.append(pf)
-        for pf in self.plant_foods[:]:
+        for pf in self.plant_foods:
             pf.update(dt)
             if pf.arrived and not pf.alive:
                 # Vial just landed in the jar — credit the player.
                 if self.plant_food < PLANT_FOOD_MAX:
                     self.plant_food += 1
                 pf.arrived = False   # one-shot
-            if not pf.alive:
-                self.plant_foods.remove(pf)
+        self.plant_foods = [pf for pf in self.plant_foods if pf.alive]
 
         # update plant cooldowns
         for ptype in list(self.plant_cooldowns.keys()):
@@ -1643,17 +1684,19 @@ class Game:
         self.projectiles.extend(new_projectiles)
 
         # update projectiles
-        for proj in self.projectiles[:]:
+        surviving_projectiles = []
+        for proj in self.projectiles:
             proj.update(dt)
             if isinstance(proj, KernelBomb):
                 # Cob Cannon: detonates at target — explodes on landing
                 if not proj.alive:
                     self._detonate_kernel(proj)
-                    self.projectiles.remove(proj)
+                else:
+                    surviving_projectiles.append(proj)
                 continue
             if not proj.alive:
-                self.projectiles.remove(proj)
                 continue
+            hit = False
             for z in self.zombies:
                 if (not z.alive or z.hp <= 0 or z.dying_timer > 0
                         or z.row != proj.row):
@@ -1669,13 +1712,23 @@ class Game:
                     # Snow Pea style: apply ice debuff + slow
                     if getattr(proj, "freezes", False):
                         z.apply_ice(proj.freeze_seconds)
-                    self.projectiles.remove(proj)
+                    hit = True
                     break
+            if not hit:
+                surviving_projectiles.append(proj)
+        self.projectiles = surviving_projectiles
+
+        # Refresh the battlefield snapshot the AI zombies read this frame.
+        # One O(plants) pass instead of every tactician/digger scanning the
+        # whole plant list for itself.
+        if DIRECTOR_ENABLED or self.zombies:
+            ai.refresh_intel(self.plants)
 
         # update zombies (bosses may spawn minions → collected here)
         new_zombies = []
-        for z in self.zombies[:]:
-            r = z.update(dt, self.plants)
+        zlist = self.zombies
+        for z in zlist[:]:
+            r = z.update(dt, self.plants, zlist)
             if isinstance(r, Zombie):
                 new_zombies.append(r)
                 # Boss aura: when the boss spawns a minion, flash a halo so the
@@ -1687,6 +1740,9 @@ class Game:
                 z._step_just_done = False
                 if not z.floating and not z.reached_house:
                     self._spawn_grass_print(z)
+            # AI zombie reaction hooks (heal beam, rally pulse, lane hop,
+            # digger dust). Emitted here so entities stay free of the FX layer.
+            self._consume_zombie_ai_fx(z)
         self.zombies.extend(new_zombies)
         # Boss-summoned minion landing: emit ground-impact ring + dust the
         # frame the minion touches down. _minion_drop_landed is set by
@@ -1744,23 +1800,10 @@ class Game:
                         break
 
         # post-zombie death handling
-        for z in self.zombies[:]:
+        dead_zombies = []
+        for z in self.zombies:
             if not z.alive:
-                self.zombies.remove(z)
-                if not z.death_counted:
-                    z.death_counted = True
-                    if z.is_boss:
-                        self.add_shake(10)
-                        self.flash_timer = 0.1
-                        self._spawn_boss_aura(z, kind="death")
-                    if z.in_wave:
-                        self.wave.zombie_died()
-                    self.sun_value += z.reward
-                    self._spawn_collect_text(z.x + z.w // 2, z.y - 6, z.reward)
-                    self._play_sound(SOUND_ZOMBIE_DIE, 0.5)
-                    # Emit head/equipment chunks NOW (just before removing from
-                    # the list) so we don't lose the spawn to a later compact.
-                    self._spawn_zombie_head(z)
+                dead_zombies.append(z)
                 continue
             # Balloon pop! Floating was True last frame and is now False —
             # the popped flag is set by Zombie.take_damage (entities.py).
@@ -1775,14 +1818,28 @@ class Game:
                 self._record_survival_run()
                 self._play_sound("lose")
                 self.state = STATE_GAME_OVER
+        for z in dead_zombies:
+            if not z.death_counted:
+                z.death_counted = True
+                if z.is_boss:
+                    self.add_shake(10)
+                    self.flash_timer = 0.1
+                    self._spawn_boss_aura(z, kind="death")
+                if z.in_wave:
+                    self.wave.zombie_died()
+                self.sun_value += z.reward
+                self._spawn_collect_text(z.x + z.w // 2, z.y - 6, z.reward)
+                self._play_sound(SOUND_ZOMBIE_DIE, 0.5)
+                self._spawn_zombie_head(z)
+        self.zombies = [z for z in self.zombies if z.alive]
 
         # update fog
-        for f in self.fog_layers[:]:
+        respawned_fog = []
+        for f in self.fog_layers:
             f.update(dt)
             if not f.alive:
-                self.fog_layers.remove(f)
-                # respawn fog
-                self.fog_layers.append(FogLayer(f.row, SCREEN_WIDTH))
+                respawned_fog.append(FogLayer(f.row, SCREEN_WIDTH))
+        self.fog_layers = [f for f in self.fog_layers if f.alive] + respawned_fog
 
         # update wave system
         self.wave.update(dt, self.zombies)
@@ -1805,95 +1862,16 @@ class Game:
         self.message.update(dt)
         self.tooltip.update(dt)
         # update floating text + plant poof + explosions + wave warning
-        for ft in self.floating_texts[:]:
+        for ft in self.floating_texts:
             ft.update(dt)
-            if not ft.alive:
-                self.floating_texts.remove(ft)
-        for ex in self.explosions[:]:
+        self.floating_texts = [ft for ft in self.floating_texts if ft.alive]
+        for ex in self.explosions:
             ex.update(dt)
-            if not ex.alive:
-                self.explosions.remove(ex)
-        for p in self.plant_poof[:]:
-            p["age"] += dt
-            if p["age"] >= p["max"]:
-                self.plant_poof.remove(p)
-        # Update debris physics + cull. Each debris is [x, y, vx, vy, color, age, lifetime].
-        for d in self.plant_debris[:]:
-            d[0] += d[2] * dt
-            d[1] += d[3] * dt
-            d[3] += 320 * dt   # gravity (light)
-            d[5] += dt
-            if d[5] >= d[6]:
-                self.plant_debris.remove(d)
-        # Update pea-impact sparks: fast moving shards that decay quickly
-        for d in self.pea_impact[:]:
-            d[0] += d[2] * dt
-            d[1] += d[3] * dt
-            # drag
-            d[2] *= (1.0 - 2.5 * dt)
-            d[3] *= (1.0 - 2.5 * dt)
-            d[5] += dt
-            if d[5] >= d[6]:
-                self.pea_impact.remove(d)
-        # Update zombie head/limb chunks: gravity-driven, ~1s lifetime
-        for d in self.zombie_heads[:]:
-            d[0] += d[2] * dt
-            d[1] += d[3] * dt
-            d[3] += 480 * dt   # heavier gravity than plant debris
-            d[5] += dt
-            if d[5] >= d[6]:
-                self.zombie_heads.remove(d)
-        # Update balloon-pop shreds: short-lived, light gravity
-        for d in self.balloon_pop[:]:
-            d[0] += d[2] * dt
-            d[1] += d[3] * dt
-            d[3] += 200 * dt   # lighter than zombie heads
-            d[2] *= (1.0 - 1.8 * dt)
-            d[5] += dt
-            if d[5] >= d[6]:
-                self.balloon_pop.remove(d)
-        # Mow dust: short, fades quickly
-        for d in self.mow_dust[:]:
-            d[0] += d[2] * dt
-            d[1] += d[3] * dt
-            d[2] *= (1.0 - 1.5 * dt)
-            d[3] *= (1.0 - 1.5 * dt)
-            d[5] += dt
-            if d[5] >= d[6]:
-                self.mow_dust.remove(d)
-        # Plant food rings: just advance age; the draw side handles expansion
-        for r in self.food_rings[:]:
-            r["age"] += dt
-            if r["age"] >= r["max"]:
-                self.food_rings.remove(r)
-        # Boss aura: rings advance age only; sparks have physics (gravity + drag)
-        for a in self.boss_aura[:]:
-            if a.get("spark"):
-                a["x"] += a["vx"] * dt
-                a["y"] += a["vy"] * dt
-                a["vy"] += 260 * dt    # gravity
-                a["vx"] *= (1.0 - 1.5 * dt)
-                a["vy"] *= (1.0 - 1.5 * dt)
-            a["age"] += dt
-            if a["age"] >= a["max"]:
-                self.boss_aura.remove(a)
-        # Grass prints: just age and fade.
-        for gp in self.grass_prints[:]:
-            gp["age"] += dt
-            if gp["age"] >= gp["max"]:
-                self.grass_prints.remove(gp)
-        # Coin drops: physics — gravity + slight drag, spin during flight
-        for c in self.coin_drops[:]:
-            c["age"] += dt
-            if c["age"] < 0:
-                continue  # waiting for staggered start
-            c["x"] += c["vx"] * dt
-            c["y"] += c["vy"] * dt
-            c["vy"] += 540 * dt       # gravity, slightly heavier than debris
-            c["vx"] *= (1.0 - 0.8 * dt)
-            c["rot"] += 6.0 * dt      # spin while in flight
-            if c["age"] >= c["max"]:
-                self.coin_drops.remove(c)
+        self.explosions = [ex for ex in self.explosions if ex.alive]
+        # One pass advances every particle (ground + air); the system culls
+        # expired ones and recycles them into its free pool.
+        self.fx.update(dt)
+        self._update_coin_drops(dt)
         self.wave_warning.update(dt)
         # Drain wave-zoom freeze. Once at 0 the wave cinematic is over and the
         # simulation runs at full speed again.
@@ -1921,6 +1899,18 @@ class Game:
         self._update_hover(self.mouse_x, self.mouse_y)
         self._refresh_cursor()
 
+    def _update_coin_drops(self, dt):
+        """Advance reward coins while either the game or result screen is visible."""
+        for c in self.coin_drops:
+            c["age"] += dt
+            if c["age"] >= 0:
+                c["x"] += c["vx"] * dt
+                c["y"] += c["vy"] * dt
+                c["vy"] += 540 * dt
+                c["vx"] *= (1.0 - 0.8 * dt)
+                c["rot"] += 6.0 * dt
+        self.coin_drops = [c for c in self.coin_drops if c["age"] < c["max"]]
+
     def draw(self):
         # Real PvZ lawn background (includes house, fence, sidewalk, sky)
         self._draw_lawn_background()
@@ -1941,7 +1931,8 @@ class Game:
 
         # draw grid (only hover/selection overlays)
         self.grid.draw(self.screen,
-                       shovel_active=bool(self.shovel and self.shovel.selected))
+                       shovel_active=bool(self.shovel and self.shovel.selected),
+                       suppress_hover=self.hover_sun is not None)
         self._draw_placement_preview()
 
         # draw lily pads (Pool mode — on water rows)
@@ -1957,23 +1948,9 @@ class Game:
         for proj in self.projectiles:
             proj.draw(self.screen)
 
-        # draw grass prints (under zombies — a foot step is below the body)
-        for gp in self.grass_prints:
-            t = gp["age"] / gp["max"]
-            # fade in fast (0..0.15), fade out slow (0.15..1.0)
-            if t < 0.15:
-                alpha = int(80 * (t / 0.15))
-            else:
-                alpha = int(80 * (1.0 - (t - 0.15) / 0.85))
-            if alpha <= 0:
-                continue
-            s = pygame.Surface((gp["w"] * 2, gp["h"] * 2), pygame.SRCALPHA)
-            # darker rim + filled center for "pressed grass" look
-            pygame.draw.ellipse(s, (60, 80, 40, alpha),
-                                (0, 0, gp["w"] * 2, gp["h"] * 2))
-            pygame.draw.ellipse(s, (40, 60, 25, int(alpha * 0.7)),
-                                (0, 0, gp["w"] * 2, gp["h"] * 2), 1)
-            self.screen.blit(s, (gp["x"] - gp["w"], gp["y"] - gp["h"]))
+        # Ground particle layer: pressed-grass footprints, soil poofs and
+        # digger dirt — all below the actors, so they read as marks on the lawn.
+        self.fx.draw_ground(self.screen)
 
         # draw zombies
         for z in self.zombies:
@@ -1997,7 +1974,7 @@ class Game:
             cx = int(c["x"])
             cy = int(c["y"])
             # outer gold ring (rotates by tilt angle)
-            coin = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
+            coin = self._get_scratch(r * 2 + 2, r * 2 + 2)
             # face (warm gold)
             pygame.draw.circle(coin, (255, 215, 60, alpha), (r + 1, r + 1), r)
             # inner highlight
@@ -2006,7 +1983,7 @@ class Game:
             # dark rim
             pygame.draw.circle(coin, (180, 130, 30, alpha), (r + 1, r + 1), r, 2)
             # "$" mark on the face — small dark ellipse rotated
-            mark = pygame.Surface((r, r), pygame.SRCALPHA)
+            mark = self._get_scratch(r, r)
             pygame.draw.ellipse(mark, (130, 95, 25, int(alpha * 0.9)),
                                 (r // 3, 1, r // 3, r - 2))
             mark = pygame.transform.rotate(mark, math.degrees(c["rot"]))
@@ -2018,135 +1995,10 @@ class Game:
         for ex in self.explosions:
             ex.draw(self.screen)
 
-        # draw plant_poof (soil dust kicked up at planting/digging time)
-        # Original PvZ: a brown ground puff + 3-4 small soil specks arcing up.
-        for p in self.plant_poof:
-            t = p["age"] / p["max"]
-            cx, cy = p["x"], p["y"]
-            # (1) ground puff: brown ellipse expands & fades along the soil line
-            r = int(18 + t * 26)
-            alpha = int(200 * (1 - t))
-            puff = pygame.Surface((r * 2, int(r * 0.55)), pygame.SRCALPHA)
-            pygame.draw.ellipse(puff, (110, 80, 45, alpha), (0, 0, r * 2, int(r * 0.55)))
-            # darker rim to read as "dirt"
-            pygame.draw.ellipse(puff, (70, 50, 28, int(alpha * 0.6)), (0, 0, r * 2, int(r * 0.55)), 2)
-            self.screen.blit(puff, (cx - r, cy - int(r * 0.18)))
-            # (2) 4 small soil specks arcing upward, falling back under gravity
-            for i in range(4):
-                ang = (i / 4.0) * 6.2831853
-                # pre-computed per-particle trajectory baked into the ring key
-                seed = (i + 1) * 13
-                sx0 = math.cos(ang) * 6
-                sy0 = -abs(math.sin(ang)) * 14 - 4
-                vx = sx0 * 2.4
-                vy = -110 - seed % 30
-                tt = min(1.0, t * 1.3)
-                x = cx + vx * tt
-                y = cy + vy * tt + 240 * tt * tt
-                size = max(1, int(3 - i * 0.4))
-                a = int(220 * (1 - t * 1.1))
-                if a <= 0:
-                    continue
-                speck = pygame.Surface((size * 2, size * 2), pygame.SRCALPHA)
-                pygame.draw.circle(speck, (95, 70, 38, a), (size, size), size)
-                self.screen.blit(speck, (int(x) - size, int(y) - size))
-
-        # draw plant_debris (leaf/petal burst on plant death)
-        for d in self.plant_debris:
-            t = d[5] / d[6]
-            r = max(1, int(4 * (1 - t * 0.5)))
-            alpha = int(255 * (1 - t))
-            petal = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
-            pygame.draw.circle(petal, (*d[4], alpha), (r + 1, r + 1), r)
-            self.screen.blit(petal, (int(d[0]) - r - 1, int(d[1]) - r - 1))
-
-        # draw pea_impact sparks (hit feedback)
-        for d in self.pea_impact:
-            t = d[5] / d[6]
-            r = max(1, int(3 * (1 - t * 0.4)))
-            alpha = int(255 * (1 - t))
-            spark = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
-            pygame.draw.circle(spark, (*d[4], alpha), (r + 1, r + 1), r)
-            self.screen.blit(spark, (int(d[0]) - r - 1, int(d[1]) - r - 1))
-
-        # draw zombie head/limb chunks flying off on death
-        for d in self.zombie_heads:
-            t = d[5] / d[6]
-            r = max(2, int(5 * (1 - t * 0.3)))
-            alpha = int(255 * (1 - t))
-            chunk = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
-            pygame.draw.ellipse(chunk, (*d[4], alpha), (1, 1, r * 2, r * 2))
-            self.screen.blit(chunk, (int(d[0]) - r - 1, int(d[1]) - r - 1))
-
-        # draw balloon-pop shreds (red rubber flying outward)
-        for d in self.balloon_pop:
-            t = d[5] / d[6]
-            r = max(2, int(6 * (1 - t * 0.4)))
-            alpha = int(255 * (1 - t))
-            shard = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
-            pygame.draw.circle(shard, (*d[4], alpha), (r + 1, r + 1), r)
-            self.screen.blit(shard, (int(d[0]) - r - 1, int(d[1]) - r - 1))
-
-        # draw lawnmower dust (soft grey puffs)
-        for d in self.mow_dust:
-            t = d[5] / d[6]
-            r = max(3, int(7 * (1 - t * 0.4)))
-            alpha = int(180 * (1 - t))
-            puff = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
-            pygame.draw.circle(puff, (*d[4], alpha), (r + 1, r + 1), r)
-            self.screen.blit(puff, (int(d[0]) - r - 1, int(d[1]) - r - 1))
-
-        # draw plant food rings (green expanding rings — PvZ2 release effect)
-        for ring in self.food_rings:
-            if ring["age"] < 0:
-                continue  # waiting for staggered start
-            t = ring["age"] / ring["max"]
-            # ease-out: fast expansion early, slow at the end
-            ease = 1.0 - (1.0 - t) * (1.0 - t)
-            radius = int(ring["r0"] + (ring["r1"] - ring["r0"]) * ease)
-            alpha = int(220 * (1.0 - t))
-            ring_surf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
-            pygame.draw.circle(ring_surf, (*ring["color"], alpha),
-                               (radius, radius), radius, 3)
-            # soft inner halo
-            inner = int(radius * 0.55)
-            pygame.draw.circle(ring_surf, (*ring["color"], int(alpha * 0.25)),
-                               (radius, radius), inner, 2)
-            self.screen.blit(ring_surf,
-                             (ring["x"] - radius, ring["y"] - radius))
-
-        # draw boss aura (rings + sparks)
-        # Rings first (under sparks), then sparks on top
-        for a in self.boss_aura:
-            if a.get("spark"):
-                continue
-            if a["age"] < 0:
-                continue
-            t = a["age"] / a["max"]
-            ease = 1.0 - (1.0 - t) * (1.0 - t)
-            radius = int(a["r0"] + (a["r1"] - a["r0"]) * ease)
-            alpha = int(220 * (1.0 - t))
-            if alpha <= 0 or radius <= 0:
-                continue
-            s = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
-            pygame.draw.circle(s, (*a["color"], alpha),
-                               (radius, radius), radius, 4)
-            # soft inner halo
-            inner = max(2, int(radius * 0.45))
-            pygame.draw.circle(s, (*a["color"], int(alpha * 0.30)),
-                               (radius, radius), inner, 2)
-            self.screen.blit(s, (a["x"] - radius, a["y"] - radius))
-        for a in self.boss_aura:
-            if not a.get("spark"):
-                continue
-            t = a["age"] / a["max"]
-            r = max(1, int(4 * (1 - t * 0.4)))
-            alpha = int(240 * (1 - t))
-            if alpha <= 0:
-                continue
-            sp = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
-            pygame.draw.circle(sp, (*a["color"], alpha), (r + 1, r + 1), r)
-            self.screen.blit(sp, (int(a["x"]) - r - 1, int(a["y"]) - r - 1))
+        # ---- particle layer (over actors) -------------------------------
+        # Pea sparks, balloon shreds, mower dust, zombie chunks, plant-food
+        # rings, boss auras and AI beams all render through one system.
+        self.fx.draw_air(self.screen)
 
         # hover highlight on plant / zombie
         if self.hover_plant is not None and self.hover_plant.alive:
@@ -2161,6 +2013,15 @@ class Game:
         # draw suns
         for sun in self.suns:
             sun.draw(self.screen)
+        # Hovered sun: a soft ring so the (now circular) click target reads
+        # under the cursor — previously the only feedback was the cursor
+        # change, which made collection feel unresponsive (阳光点击效果不对).
+        if self.hover_sun is not None and self.hover_sun.alive:
+            s = self.hover_sun
+            cx, cy = (int(v) for v in s._visual_center())
+            t = pygame.time.get_ticks() / 1000.0
+            rad = SUN_COLLECT_RADIUS + 3 + math.sin(t * 6.0) * 1.5
+            pygame.draw.circle(self.screen, (255, 244, 170), (cx, cy), int(rad), 2)
 
         # draw plant food drops (能量豆)
         for pf in self.plant_foods:
@@ -2249,7 +2110,9 @@ class Game:
         if self.bg_type == BG_POOL:
             # Water lanes pre-rendered once at level start.
             if self._water_layer is not None:
-                self.screen.blit(self._water_layer, (self.grid.x, self.grid.y))
+                self.screen.blit(self._water_layer,
+                                 (self.grid.x,
+                                  self.grid.y + self._water_row0 * CELL_H))
         elif self.bg_type == BG_FOG:
             self.screen.blit(self._fog_veil, (0, 0))
         elif self.bg_type == BG_ROOF:
@@ -2296,16 +2159,10 @@ class Game:
                              rect.topleft)
             pygame.draw.rect(self.screen, (110, 255, 120) if allowed else (255, 100, 100),
                              rect, 3)
-        icon_key = {
-            PLANT_PEASHOOTER: "plant_peashooter", PLANT_SUNFLOWER: "plant_sunflower",
-            PLANT_WALLNUT: "plant_wallnut", PLANT_CHERRYBOMB: "plant_cherrybomb",
-            PLANT_FUMESHROOM: "plant_fumeshroom", PLANT_LILYPAD: "ui_lily_pad",
-            PLANT_SNOWPEA: "plant_peashooter",
-        }.get(selected)
-        icon = assets_loader.scale(icon_key, 64, 64) if icon_key else None
+        icon = assets_loader.cursor_icon(selected, 64)
         if icon is not None:
             # cached translucent copy (icon.copy() every frame adds up)
-            ck = ("preview", icon_key, 150 if allowed else 85)
+            ck = ("preview", selected, 150 if allowed else 85)
             ghost = self._ghost_cache.get(ck)
             if ghost is None:
                 ghost = icon.copy()
@@ -2316,32 +2173,44 @@ class Game:
     def _draw_wave_zoom_overlay(self):
         """Red-tinted radial vignette while _zoom_freeze > 0.
         Cheap approach: 4 dark corner gradients + faint red wash on top half.
+        Surfaces are built once and cached — they never change between calls.
         """
         sw, sh = SCREEN_WIDTH, SCREEN_HEIGHT
-        # Four corner gradients — same surface rotated/blit for each corner.
-        # Use a single dark corner gradient and blit it in 4 spots.
-        corner = pygame.Surface((sw // 3, sh // 3), pygame.SRCALPHA)
-        cx0, cy0 = corner.get_size()
-        # Build gradient: alpha = 180 at the corner vertex, 0 along the opposite edges.
-        for r in range(60):
-            a = int(180 * (1.0 - r / 60))
-            if a <= 0:
-                continue
-            pygame.draw.circle(corner, (0, 0, 0, a), (0, 0), 60 - r, 1)
-        # Mirror/rotate to other corners
-        self.screen.blit(corner, (0, 0))                                     # TL
-        self.screen.blit(pygame.transform.flip(corner, True, False),          # TR
-                         (sw - cx0, 0))
-        self.screen.blit(pygame.transform.flip(corner, False, True),          # BL
-                         (0, sh - cy0))
-        self.screen.blit(pygame.transform.flip(corner, True, True),           # BR
-                         (sw - cx0, sh - cy0))
-        # Red flash wash (top half) — strong, signals alarm
-        wash = pygame.Surface((sw, sh // 2), pygame.SRCALPHA)
-        for y in range(sh // 2):
-            a = int(60 * (1.0 - y / (sh // 2)))
-            pygame.draw.line(wash, (180, 30, 30, a), (0, y), (sw, y), 1)
-        self.screen.blit(wash, (0, 0))
+        if not hasattr(self, '_zoom_corner'):
+            # Build corner gradient once: alpha = 180 at vertex, 0 along edges.
+            # Filled per pixel from the corner distance — drawing it as 1px
+            # rings left a dithered, banded blob over the sun jar.
+            cx0, cy0 = sw // 3, sh // 3
+            corner = pygame.Surface((cx0, cy0), pygame.SRCALPHA)
+            corner.fill((0, 0, 0, 0))
+            span = 60.0
+            corner.lock()
+            for y in range(int(span)):
+                for x in range(int(span)):
+                    a = int(180 * (1.0 - math.hypot(x, y) / span))
+                    if a > 0:
+                        corner.set_at((x, y), (0, 0, 0, a))
+            corner.unlock()
+            # Pre-flip for the other three corners
+            self._zoom_corner = corner
+            self._zoom_corner_tr = pygame.transform.flip(corner, True, False)
+            self._zoom_corner_bl = pygame.transform.flip(corner, False, True)
+            self._zoom_corner_br = pygame.transform.flip(corner, True, True)
+            self._zoom_cx0 = cx0
+            self._zoom_cy0 = cy0
+            # Red flash wash (top half) — built once
+            wash = pygame.Surface((sw, sh // 2), pygame.SRCALPHA)
+            for y in range(sh // 2):
+                a = int(60 * (1.0 - y / (sh // 2)))
+                pygame.draw.line(wash, (180, 30, 30, a), (0, y), (sw, y), 1)
+            self._zoom_wash = wash
+        # Blit cached surfaces. The top corners start below the seed bar so the
+        # cinematic never dims the sun jar / seed cards the player is reading.
+        self.screen.blit(self._zoom_corner, (0, UI_BAR_H))
+        self.screen.blit(self._zoom_corner_tr, (sw - self._zoom_cx0, UI_BAR_H))
+        self.screen.blit(self._zoom_corner_bl, (0, sh - self._zoom_cy0))
+        self.screen.blit(self._zoom_corner_br, (sw - self._zoom_cx0, sh - self._zoom_cy0))
+        self.screen.blit(self._zoom_wash, (0, UI_BAR_H))
 
     def _draw_sun_jar(self):
         import assets_loader
@@ -2354,11 +2223,14 @@ class Game:
                                (jar_cx, jar_cy), glow_r,
                                max(2, int(4 * self.sun_pulse)))
         # Use the clean 240px sun artwork; the small v_Sun.png leaves a dark
-        # speckled halo after matte removal.
+        # speckled halo after matte removal. The smoothscale is size-stable,
+        # so cache it — scaling a 240px source every frame is pure waste.
         sun_jar_img = assets_loader.get("ui_sun")
         if sun_jar_img:
-            jar = pygame.transform.smoothscale(sun_jar_img, (SUN_JAR_W, SUN_JAR_W))
-            self.screen.blit(jar, (SUN_JAR_X, SUN_JAR_Y - 2))
+            if getattr(self, "_sun_jar_scaled", None) is None:
+                self._sun_jar_scaled = pygame.transform.smoothscale(
+                    sun_jar_img, (SUN_JAR_W, SUN_JAR_W))
+            self.screen.blit(self._sun_jar_scaled, (SUN_JAR_X, SUN_JAR_Y - 2))
         else:
             pygame.draw.circle(self.screen, COLOR_YELLOW, (jar_cx, jar_cy), SUN_JAR_W // 2)
             pygame.draw.circle(self.screen, COLOR_ORANGE, (jar_cx, jar_cy), SUN_JAR_W // 2, 2)
@@ -2445,44 +2317,60 @@ class Game:
                     (fx_pos, y - fh), (fx_pos + (9 if big else 6), y - fh + 3),
                     (fx_pos, y - fh + 6)])
 
+    def _get_scratch(self, w, h):
+        """Return a reusable SRCALPHA surface of the given size, cleared to transparent."""
+        key = (w, h)
+        s = self._scratch_cache.get(key)
+        if s is None:
+            s = pygame.Surface((w, h), pygame.SRCALPHA)
+            self._scratch_cache[key] = s
+        else:
+            s.fill((0, 0, 0, 0))
+        return s
+
     def _draw_ghost_cursor(self):
         """Seed packet / shovel sprite glued to the cursor while a tool is held."""
         selected = next((b for b in self.seed_buttons if b.selected), None)
+        plant_type = None
         icon_key = None
         if selected is not None:
-            icon_key = {
-                PLANT_PEASHOOTER: "plant_peashooter", PLANT_SUNFLOWER: "plant_sunflower",
-                PLANT_WALLNUT: "plant_wallnut", PLANT_CHERRYBOMB: "plant_cherrybomb",
-                PLANT_FUMESHROOM: "plant_fumeshroom", PLANT_LILYPAD: "ui_lily_pad",
-                PLANT_SNOWPEA: "plant_peashooter",
-            }.get(selected.plant_type)
+            plant_type = selected.plant_type
+            icon_key = f"ghost_{plant_type}"
         elif self.shovel and self.shovel.selected:
             icon_key = "ui_shovel"
         if icon_key is None:
             return
         img = self._ghost_cache.get(icon_key)
         if img is None:
-            base = assets_loader.scale(icon_key, 56, 56)
+            if plant_type is not None:
+                # Clean sprite art: the wiki icons are photos of the plant on a
+                # grass backdrop and blitted as an opaque box that swallowed a
+                # sun sitting under the cursor.
+                base = assets_loader.cursor_icon(plant_type, 56)
+            else:
+                base = assets_loader.scale("ui_shovel", 56, 56)
             if base is None:
                 return
-            # Drop any opaque white pixels left over from the source sprite's
-            # matte; otherwise the ghost cursor leaves a white square behind.
-            img = pygame.Surface((56, 56), pygame.SRCALPHA)
+            w, h = base.get_size()
+            img = pygame.Surface((w, h), pygame.SRCALPHA)
             img.lock()
-            for y in range(56):
-                for x in range(56):
+            for y in range(h):
+                for x in range(w):
                     p = base.get_at((x, y))
-                    if p.a > 240 and p.r > 240 and p.g > 240 and p.b > 240:
+                    if plant_type is None and p.a > 240 and p.r > 240 \
+                            and p.g > 240 and p.b > 240:
+                        # shovel sprite keeps an opaque white matte
                         img.set_at((x, y), (255, 255, 255, 0))
                     else:
-                        img.set_at((x, y), (p.r, p.g, p.b, int(p.a * 0.69)))
+                        img.set_at((x, y), (p.r, p.g, p.b, int(p.a * 0.52)))
             img.unlock()
             self._ghost_cache[icon_key] = img
         self.screen.blit(img, img.get_rect(center=(self.mouse_x, self.mouse_y + 6)))
 
     def draw_state(self):
         if self.state == STATE_MENU:
-            self.menu.draw(self.screen)
+            self.menu.draw(self.screen,
+                           muted=bool(self.save.settings.get("mute")))
         elif self.state == STATE_MODE_SELECT:
             self.mode_select.draw(self.screen)
         elif self.state == STATE_LEVEL_SELECT:
