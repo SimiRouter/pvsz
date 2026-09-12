@@ -43,10 +43,12 @@ class Grid:
     def update_hover(self, mx, my):
         self.hover_cell = self.get_cell(mx, my)
 
-    def draw(self, screen, shovel_active=False):
+    def draw(self, screen, shovel_active=False, suppress_hover=False):
         # No-op: the lawn background image already shows the grass tiles.
-        # Just draw hover/selection overlays.
-        if self.hover_cell:
+        # Just draw hover/selection overlays. suppress_hover is set while a
+        # sun sits under the cursor: the one-sided white wash on the hovered
+        # cell made a sun straddling a tile boundary look split in two.
+        if self.hover_cell and not suppress_hover:
             row, col = self.hover_cell
             pos = (self.x + col * self.cell_w, self.y + row * self.cell_h)
             overlay = self._shovel_overlay if shovel_active else self._hover_overlay

@@ -58,13 +58,45 @@ def _blit_contained(screen, image, rect, padding=0, upscale=True):
     return dest
 
 
+def _fit_size(text, max_width, max_size=18, min_size=10):
+    """Largest CJK-capable font size whose rendered width fits max_width."""
+    for size in range(max_size, min_size - 1, -1):
+        if i18n.font(size).size(text)[0] <= max_width:
+            return size
+    return min_size
+
+
 def _fit_font(text, max_width, max_size=18, min_size=10):
     """Choose the largest cached CJK-capable font that fits max_width."""
-    for size in range(max_size, min_size - 1, -1):
-        f = i18n.font(size)
-        if f.size(text)[0] <= max_width:
-            return f
-    return i18n.font(min_size)
+    return i18n.font(_fit_size(text, max_width, max_size, min_size))
+
+
+def invalidate_text_caches():
+    """Drop every menu-screen render cache.
+
+    Cached renders are keyed on text+size (fx._text_cache) or held on the
+    card objects themselves; a language toggle changes what the keys
+    resolve to and the level-select rebuild replaces the card set."""
+    global _halo_cache
+    fx._text_cache.clear()
+    _halo_cache.clear()
+
+
+_halo_cache = {}
+
+
+def _halo_sprite(size, color, width, radius):
+    """Pre-rendered rounded-rect stroke for the hover halo, cached per
+    (size, colour, width) — the halo used to mint a fresh full-alpha SRCALPHA
+    surface every animation frame of a hovered button."""
+    key = (size, color, width, radius)
+    halo = _halo_cache.get(key)
+    if halo is None:
+        halo = pygame.Surface(size, pygame.SRCALPHA)
+        pygame.draw.rect(halo, (*color, 255), halo.get_rect(), width,
+                         border_radius=radius)
+        _halo_cache[key] = halo
+    return halo
 
 
 def _dim_overlay(alpha):
@@ -74,6 +106,19 @@ def _dim_overlay(alpha):
     if surf is None:
         surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
         surf.fill((0, 0, 0, alpha))
+        _blit_fit_cache[key] = surf
+    return surf
+
+
+def _panel_surface(w, h, color):
+    """Cached SRCALPHA panel fill. Seed-select card slots used to allocate a
+    fresh Surface per card per frame; there are only a handful of fill
+    colours, so cache them."""
+    key = ("panel", w, h, color)
+    surf = _blit_fit_cache.get(key)
+    if surf is None:
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        surf.fill(color)
         _blit_fit_cache[key] = surf
     return surf
 
@@ -96,12 +141,17 @@ def draw_button(screen, rect, label, base_color, hover=False, font=None,
                 continue
             # alpha fades, radius grows
             alpha = int(160 * (1.0 - t))
+            if alpha <= 0:
+                continue
             grow = int(2 + 18 * t)
             halo_w = base_w + grow
             halo_rect = r.inflate(grow * 2, grow)
-            halo = pygame.Surface(halo_rect.size, pygame.SRCALPHA)
-            pygame.draw.rect(halo, (*color, alpha), halo.get_rect(),
-                             halo_w, border_radius=12)
+            # Full-alpha rounded stroke from the per-(size,colour,width)
+            # cache + one quantized alpha stamp (fade_cache): steady hover
+            # now allocates nothing, where the old code minted a fresh
+            # SRCALPHA surface every frame of the pulse.
+            halo = fx.faded(_halo_sprite(halo_rect.size, color, halo_w, 12),
+                            alpha)
             screen.blit(halo, halo_rect.topleft)
     if hover:
         color = tuple(min(255, c + 50) for c in base_color)
@@ -256,8 +306,9 @@ class SeedButton:
         if self.cooldown_remaining > 0:
             ratio = max(0.0, min(1.0, self.cooldown_remaining / self.cooldown_max)) if self.cooldown_max > 0 else 0
             overlay_h = int(self.h * ratio)
-            pygame.draw.rect(screen, (0, 0, 0, 180),
-                             (self.x, self.y + self.h - overlay_h, self.w, overlay_h), border_radius=6)
+            fx.alpha_rect(screen, (0, 0, 0, 180),
+                          (self.x, self.y + self.h - overlay_h, self.w, overlay_h),
+                          radius=6)
             cd_text = fx.cached_text(f"{self.cooldown_remaining:.1f}", 14, COLOR_WHITE, outline=(0, 0, 0))
             screen.blit(cd_text, cd_text.get_rect(center=slot.center))
         screen.set_clip(old_clip)
@@ -268,7 +319,14 @@ class SeedButton:
         # try to use real plant sprite (96x96 source)
         img = assets_loader.plant_icon(self.plant_type)
         if img is not None:
-            scaled = pygame.transform.smoothscale(img, (size, size))
+            # Cache the scaled icon per (source, size): seed cards redraw
+            # every frame and smoothscale was burning one fresh surface per
+            # card per frame (2/frame in play, 8/frame on seed select).
+            key = ("icon", id(img), size)
+            scaled = _blit_fit_cache.get(key)
+            if scaled is None:
+                scaled = _blit_fit_cache[key] = \
+                    pygame.transform.smoothscale(img, (size, size))
             screen.blit(scaled, (x, y))
             return
         # fallback drawings
@@ -344,8 +402,9 @@ class Tooltip:
         # clamp to screen
         self.x = max(5, min(self.x, SCREEN_WIDTH - tw - 5))
         self.y = max(UI_BAR_H + 5, min(self.y, SCREEN_HEIGHT - th - 5))
-        pygame.draw.rect(screen, (30, 30, 30, 230), (self.x, self.y, tw, th), border_radius=6)
-        pygame.draw.rect(screen, COLOR_WHITE, (self.x, self.y, tw, th), 1, border_radius=6)
+        # PvZ-style warm parchment tooltip instead of an opaque black block.
+        fx.alpha_rect(screen, (88, 66, 38, 238), (self.x, self.y, tw, th), radius=6)
+        pygame.draw.rect(screen, (255, 220, 130), (self.x, self.y, tw, th), 1, border_radius=6)
         for i, line in enumerate(lines):
             screen.blit(line, (self.x + 10, self.y + 6 + i * 22))
 
@@ -387,7 +446,7 @@ class Message:
         y = UI_BAR_H + 8
         bg = pygame.Rect(SCREEN_WIDTH // 2 - t.get_width() // 2 - 10,
                          y, t.get_width() + 20, t.get_height() + 10)
-        pygame.draw.rect(screen, (0, 0, 0, 180), bg, border_radius=6)
+        fx.alpha_rect(screen, (0, 0, 0, 180), bg, radius=6)
         screen.blit(t, (SCREEN_WIDTH // 2 - t.get_width() // 2, y + 5))
 
 
@@ -435,7 +494,7 @@ class MenuScreen:
         if self._hover and self._hover != prev:
             pulse_hover()
 
-    def draw(self, screen):
+    def draw(self, screen, muted=False):
         import assets_loader
         bg = assets_loader.get("bg_day_full")
         if bg:
@@ -445,11 +504,11 @@ class MenuScreen:
             screen.fill((50, 100, 50))
         title = cached_text("PLANTS VS ZOMBIES", 72, (255, 230, 0), outline=(0, 0, 0))
         screen.blit(title, (SCREEN_WIDTH // 2 - title.get_width() // 2, 80))
-        sub = self.font.render(tr("Python Edition"), True, COLOR_WHITE)
+        sub = cached_text(tr("Python Edition"), 32, COLOR_WHITE)
         screen.blit(sub, (SCREEN_WIDTH // 2 - sub.get_width() // 2, 170))
-        instr = self.small_font.render(tr("Click a seed packet, then click the lawn to plant"), True, COLOR_WHITE)
+        instr = cached_text(tr("Click a seed packet, then click the lawn to plant"), 24, COLOR_WHITE)
         screen.blit(instr, (SCREEN_WIDTH // 2 - instr.get_width() // 2, 220))
-        instr2 = self.small_font.render(tr("Click falling suns to collect them"), True, COLOR_WHITE)
+        instr2 = cached_text(tr("Click falling suns to collect them"), 24, COLOR_WHITE)
         screen.blit(instr2, (SCREEN_WIDTH // 2 - instr2.get_width() // 2, 250))
         # Buttons
         self._draw_btn(screen, self.btn_start, tr("Start Game"), "start", (60, 130, 60))
@@ -461,23 +520,25 @@ class MenuScreen:
         pygame.draw.rect(screen, (100, 100, 115) if self._hover == "lang" else (70, 70, 80),
                          lrect, border_radius=8)
         pygame.draw.rect(screen, (200, 200, 200), lrect, 2, border_radius=8)
-        lt = self.small_font.render(lang, True, COLOR_WHITE)
+        lt = cached_text(lang, 24, COLOR_WHITE)
         screen.blit(lt, (lrect.centerx - lt.get_width() // 2, lrect.centery - lt.get_height() // 2))
 
         if self.show_help:
             panel = pygame.Rect(SCREEN_WIDTH // 2 - 360, 258, 720, 118)
-            pygame.draw.rect(screen, (20, 25, 22, 225), panel, border_radius=10)
+            fx.alpha_rect(screen, (20, 25, 22, 225), panel, radius=10)
             pygame.draw.rect(screen, (220, 220, 180), panel, 2, border_radius=10)
             lines = [
                 tr("Click a seed packet, then click the lawn to plant"),
                 tr("Click falling suns to collect them"),
                 tr("Collect falling plant food, then click a plant to feed it"),
-                "P: " + tr("PAUSED") + "   F: " + tr("Speed x2") + "   M: " + tr("Sound OFF") + "   F11: Fullscreen",
+                "P: " + tr("PAUSED") + "   F: " + tr("Speed x2") + "   M: "
+                + (tr("Sound ON") if muted else tr("Sound OFF")) + "   F11: "
+                + tr("Fullscreen"),
             ]
             for i, line in enumerate(lines):
-                f = _fit_font(line, panel.w - 24, 18, 11)
-                txt = f.render(line, True, COLOR_WHITE)
-                screen.blit(txt, txt.get_rect(center=(panel.centerx, panel.y + 18 + i * 26)))
+                f = cached_text(line, _fit_size(line, panel.w - 24, 18, 11),
+                                COLOR_WHITE)
+                screen.blit(f, f.get_rect(center=(panel.centerx, panel.y + 18 + i * 26)))
 
     def _draw_btn(self, screen, rect, label, key, base_color):
         draw_button(screen, rect, label, base_color, self._hover == key, font_size=36)
@@ -513,15 +574,15 @@ class GameOverScreen:
         screen.blit(_dim_overlay(180), (0, 0))
         if survival:
             if i18n.is_zh():
-                text = self.font.render(f"你坚持了 {max(0, wave_num - 1)} 波！", True, COLOR_WHITE)
+                text = cached_text(f"你坚持了 {max(0, wave_num - 1)} 波！", 48, COLOR_WHITE)
             else:
-                text = self.font.render(f"You survived {max(0, wave_num - 1)} waves!", True, COLOR_WHITE)
+                text = cached_text(f"You survived {max(0, wave_num - 1)} waves!", 48, COLOR_WHITE)
         else:
-            text = self.font.render(tr("Game Over!"), True, COLOR_RED)
+            text = cached_text(tr("Game Over!"), 48, COLOR_RED)
         screen.blit(text, (SCREEN_WIDTH // 2 - text.get_width() // 2, 170))
         if not survival:
             # the iconic line from the original defeat screen
-            brains = self.small_font.render(tr("The zombies ate your brains!"), True, (235, 60, 50))
+            brains = cached_text(tr("The zombies ate your brains!"), 28, (235, 60, 50))
             screen.blit(brains, (SCREEN_WIDTH // 2 - brains.get_width() // 2, 260))
         draw_button(screen, self.btn_retry, tr("Retry"), (60, 130, 60), self._hover == "retry")
         draw_button(screen, self.btn_menu, tr("Main Menu"), (130, 60, 60), self._hover == "menu")
@@ -557,7 +618,7 @@ class LevelCompleteScreen:
 
     def draw(self, screen):
         screen.blit(_dim_overlay(180), (0, 0))
-        text = self.font.render(tr("Victory! You saved the house!"), True, (120, 255, 120))
+        text = cached_text(tr("Victory! You saved the house!"), 48, (120, 255, 120))
         screen.blit(text, (SCREEN_WIDTH // 2 - text.get_width() // 2, 200))
         draw_button(screen, self.btn_next, tr("Next Level"), (60, 130, 60), self._hover == "next")
         draw_button(screen, self.btn_map, tr("Back to Map"), (60, 90, 130), self._hover == "map")
@@ -594,12 +655,12 @@ class PauseScreen:
 
     def draw(self, screen):
         screen.blit(_dim_overlay(150), (0, 0))
-        text = self.font.render(tr("PAUSED"), True, COLOR_WHITE)
+        text = cached_text(tr("PAUSED"), 48, COLOR_WHITE)
         screen.blit(text, (SCREEN_WIDTH // 2 - text.get_width() // 2, 170))
         draw_button(screen, self.btn_resume, tr("Resume"), (60, 130, 60), self._hover == "resume")
         draw_button(screen, self.btn_restart, tr("Restart"), (60, 90, 130), self._hover == "restart")
         draw_button(screen, self.btn_menu, tr("Main Menu"), (130, 60, 60), self._hover == "menu")
-        sub = self.small_font.render("P: " + tr("Resume") + "   Esc: " + tr("Main Menu"), True, (170, 170, 170))
+        sub = cached_text("P: " + tr("Resume") + "   Esc: " + tr("Main Menu"), 28, (170, 170, 170))
         screen.blit(sub, (SCREEN_WIDTH // 2 - sub.get_width() // 2, 540))
 
 
@@ -625,10 +686,10 @@ class ModeButton:
         pygame.draw.rect(screen, color, (self.x, self.y, self.w, self.h), border_radius=10)
         pygame.draw.rect(screen, COLOR_WHITE, (self.x, self.y, self.w, self.h), 2, border_radius=10)
         # label
-        lt = font.render(tr(self.label), True, COLOR_WHITE)
+        lt = cached_text(tr(self.label), 28, COLOR_WHITE)
         screen.blit(lt, (self.x + self.w // 2 - lt.get_width() // 2, self.y + 12))
         # desc
-        dt = i18n.font(20).render(tr(self.desc), True, (180, 180, 180))
+        dt = cached_text(tr(self.desc), 20, (180, 180, 180))
         screen.blit(dt, (self.x + self.w // 2 - dt.get_width() // 2, self.y + 48))
 
 
@@ -664,7 +725,7 @@ class ModeSelectScreen:
             screen.blit(_dim_overlay(80), (0, 0))
         else:
             screen.fill((40, 80, 40))
-        title = self.title_font.render(tr("Select Game Mode"), True, COLOR_WHITE)
+        title = cached_text(tr("Select Game Mode"), 56, COLOR_WHITE)
         screen.blit(title, (SCREEN_WIDTH // 2 - title.get_width() // 2, 80))
         for btn in self.buttons:
             btn.draw(screen, self.font)
@@ -719,8 +780,8 @@ class LevelCard:
             pygame.draw.rect(screen, (50, 40, 40), rect, border_radius=8)
             pygame.draw.rect(screen, (80, 60, 60), rect, 2, border_radius=8)
             lock_text = tr("LOCKED")
-            lock_font = _fit_font(lock_text, self.w - 12, 22, 11)
-            lock = lock_font.render(lock_text, True, (180, 140, 140))
+            lock = cached_text(lock_text, _fit_size(lock_text, self.w - 12, 22, 11),
+                               (180, 140, 140))
             screen.blit(lock, lock.get_rect(center=rect.center))
             screen.set_clip(old_clip)
             return
@@ -803,7 +864,6 @@ class LevelSelectScreen:
 
     def handle_mouse(self, mx, my, activate=True):
         hit = None
-        prev_hover = any(c.hover for c in self.cards)
         for card in self.cards:
             was_hover = card.hover
             card.hover = card.contains(mx, my) and card.unlocked
@@ -821,13 +881,13 @@ class LevelSelectScreen:
             screen.blit(_dim_overlay(100), (0, 0))
         else:
             screen.fill((30, 60, 30))
-        title = self.title_font.render(self.title, True, COLOR_WHITE)
+        title = cached_text(self.title, 44, COLOR_WHITE)
         screen.blit(title, (SCREEN_WIDTH // 2 - title.get_width() // 2, 20))
 
         if self.show_world_labels:
             y_base = 82
             for w in range(5):
-                label = self.font.render(tr(self.world_labels[w]), True, (240, 220, 120))
+                label = cached_text(tr(self.world_labels[w]), 24, (240, 220, 120))
                 screen.blit(label, (18, y_base + w * 90 + (76 - label.get_height()) // 2))
 
         for card in self.cards:
@@ -905,24 +965,25 @@ class SeedSelectScreen:
             screen.blit(bg, (0, 0))
         screen.blit(_dim_overlay(150), (0, 0))
 
-        title = self.title_font.render(tr(self.title), True, (255, 230, 0))
+        title = cached_text(tr(self.title), 48, (255, 230, 0))
         screen.blit(title, (SCREEN_WIDTH // 2 - title.get_width() // 2, 60))
-        sub = self.big_font.render(i18n.fmt_level_name(self.level_name), True, COLOR_WHITE)
+        sub = cached_text(i18n.fmt_level_name(self.level_name), 30, COLOR_WHITE)
         screen.blit(sub, (SCREEN_WIDTH // 2 - sub.get_width() // 2, 110))
 
         # label — aligned to the card row so it never overlaps a card
         rects = self._card_rects()
         row_x0 = min(r.x for r in rects.values()) if rects else 90
-        lab = self.font.render(tr("Available plants — click to include in your pack:"),
-                               True, (205, 205, 205))
+        lab = cached_text(tr("Available plants — click to include in your pack:"),
+                          24, (205, 205, 205))
         screen.blit(lab, (row_x0, 148))
         for ptype, r in rects.items():
             in_pack = ptype in self.picked
             hovered = self._hover == ("seed", ptype)
-            slot = pygame.Surface((r.w, r.h), pygame.SRCALPHA)
-            slot.fill((68, 76, 72, 240) if hovered else
-                      ((58, 64, 62, 235) if in_pack else (42, 44, 45, 225)))
-            screen.blit(slot, r.topleft)
+            # Cached fill panel (hover / packed / empty — three colours);
+            # used to allocate a fresh SRCALPHA surface per card per frame.
+            slot_color = ((68, 76, 72, 240) if hovered else
+                          ((58, 64, 62, 235) if in_pack else (42, 44, 45, 225)))
+            screen.blit(_panel_surface(r.w, r.h, slot_color), r.topleft)
             pygame.draw.rect(screen,
                              (255, 245, 150) if hovered else
                              ((255, 225, 80) if in_pack else (150, 150, 150)),
@@ -934,23 +995,21 @@ class SeedSelectScreen:
             _blit_contained(screen, img, image_rect, padding=2)
 
             status = tr("IN PACK") if in_pack else tr("off")
-            status_font = _fit_font(status, r.w - 12, 15, 10)
-            stxt = status_font.render(status, True,
-                                      (255, 230, 70) if in_pack else (170, 170, 170))
+            stxt = cached_text(status, _fit_size(status, r.w - 12, 15, 10),
+                               (255, 230, 70) if in_pack else (170, 170, 170))
             screen.blit(stxt, stxt.get_rect(center=(r.centerx, r.y + 101)))
 
             info = PLANT_INFO[ptype]
             name = i18n.plant_name(ptype)
-            name_font = _fit_font(name, r.w - 12, 16, 10)
-            nm = name_font.render(name, True, COLOR_WHITE)
+            nm = cached_text(name, _fit_size(name, r.w - 12, 16, 10), COLOR_WHITE)
             screen.blit(nm, nm.get_rect(center=(r.centerx, r.y + 119)))
-            cost = i18n.font(13).render(str(info["cost"]), True, COLOR_YELLOW)
+            cost = cached_text(str(info["cost"]), 13, COLOR_YELLOW)
             screen.blit(cost, cost.get_rect(center=(r.centerx, r.y + 136)))
 
         # compact pack summary: native-ratio mini cards, fully inside panel
         py = 392
         pk_text = f"{tr('Your pack')} ({len(self.picked)}/{len(self.available)})"
-        pk = self.big_font.render(pk_text, True, COLOR_WHITE)
+        pk = cached_text(pk_text, 30, COLOR_WHITE)
         screen.blit(pk, (90, py - 38))
         for i, ptype in enumerate(self.picked):
             x = 90 + i * (SEED_CARD_W + 10)
@@ -966,18 +1025,18 @@ class SeedSelectScreen:
         col = (80, 170, 80) if hover else (60, 130, 60)
         pygame.draw.rect(screen, col, self.start_btn, border_radius=10)
         pygame.draw.rect(screen, (0, 0, 0), self.start_btn, 3, border_radius=10)
-        st = self.big_font.render(tr("Start!"), True, COLOR_WHITE)
+        st = cached_text(tr("Start!"), 30, COLOR_WHITE)
         screen.blit(st, (self.start_btn.centerx - st.get_width() // 2,
                          self.start_btn.centery - st.get_height() // 2))
         # back
         bh_over = self._hover == "back"
         bcol = (140, 90, 60) if bh_over else (110, 70, 50)
         pygame.draw.rect(screen, bcol, self.back_btn, border_radius=8)
-        bt = self.font.render(tr("Back"), True, COLOR_WHITE)
+        bt = cached_text(tr("Back"), 24, COLOR_WHITE)
         screen.blit(bt, (self.back_btn.centerx - bt.get_width() // 2,
                          self.back_btn.centery - bt.get_height() // 2))
-        hint = self.font.render(tr("1-6 keys pick seeds in-game · Space skips the wait between waves"),
-                                True, (160, 160, 160))
+        hint = cached_text(tr("1-6 keys pick seeds in-game · Space skips the wait between waves"),
+                           24, (160, 160, 160))
         screen.blit(hint, (SCREEN_WIDTH // 2 - hint.get_width() // 2, 24))
         hint2 = cached_text(tr("Collect falling plant food, then click a plant to feed it"),
                             22, (150, 235, 150), outline=(0, 0, 0))
@@ -1014,11 +1073,11 @@ class SurvivalCompleteScreen:
     def draw(self, screen, waves):
         screen.blit(_dim_overlay(180), (0, 0))
         if i18n.is_zh():
-            text = self.font.render(f"坚持了 {waves} 波！", True, COLOR_WHITE)
+            text = cached_text(f"坚持了 {waves} 波！", 48, COLOR_WHITE)
         else:
-            text = self.font.render(f"Survived {waves} waves!", True, COLOR_WHITE)
+            text = cached_text(f"Survived {waves} waves!", 48, COLOR_WHITE)
         screen.blit(text, (SCREEN_WIDTH // 2 - text.get_width() // 2, 200))
         draw_button(screen, self.btn_retry, tr("Retry"), (60, 130, 60), self._hover == "retry")
         draw_button(screen, self.btn_menu, tr("Main Menu"), (130, 60, 60), self._hover == "menu")
-        sub = self.small_font.render(tr("Click to return to menu"), True, (170, 170, 170))
+        sub = cached_text(tr("Click to return to menu"), 28, (170, 170, 170))
         screen.blit(sub, (SCREEN_WIDTH // 2 - sub.get_width() // 2, 540))

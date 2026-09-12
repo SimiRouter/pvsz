@@ -102,7 +102,6 @@ _ZH = {
     "Sound ON": "声音已开启",
     "Sound OFF": "声音已关闭",
     "Click seed → Click lawn. Collect sun. Stop zombies!": "点种子 → 点草坪种植；收集阳光；阻止僵尸！",
-    "Your pack": "你的背包",
     "Level complete!": "关卡完成！",
     "The zombies ate your brains!": "僵尸吃掉了你的脑子！",
     "Survived": "坚持了",
@@ -122,6 +121,10 @@ _ZH = {
     "Next wave:": "下一波：",
     "Survival: Wave": "生存：第",
     "collected!": "已收集！",
+    "FIRE!": "开火！",
+    "BOOM!": "轰！",
+    "*fizzle*": "*哑火*",
+    "Fullscreen": "全屏",
 
     # --- shovel / toolbar tooltip words used in hover ---
     "HP:": "生命：",
@@ -195,6 +198,10 @@ def zombie_name(zombie_type):
             "boss": "僵王博士",
             "balloon": "气球僵尸",
             "bungee": "蹦极僵尸",
+            "tactician": "战术僵尸",
+            "digger": "矿工僵尸",
+            "healer": "治疗僵尸",
+            "commander": "指挥官僵尸",
         }
         return names.get(zombie_type, "僵尸")
     return {
@@ -207,6 +214,10 @@ def zombie_name(zombie_type):
         "boss": "Zomboss",
         "balloon": "Balloon Zombie",
         "bungee": "Bungee Zombie",
+        "tactician": "Tactician Zombie",
+        "digger": "Digger Zombie",
+        "healer": "Healer Zombie",
+        "commander": "Commander Zombie",
     }.get(zombie_type, "Zombie")
 
 
