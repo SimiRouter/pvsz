@@ -1784,6 +1784,11 @@ class Zombie:
         self.hp = info["hp"]
         self.base_speed = info["speed"]
         self.speed = info["speed"]
+        # Survival wave scaling multiplier captured at spawn. Mid-life speed
+        # transitions (pole vault landing, balloon pop, newspaper rage) are
+        # derived from base_speed * this so late-wave zombies never snap back
+        # to early-game absolute speeds.
+        self._speed_mult = 1.0
         self.reward = info["reward"]
         self.w = 90   # logical box; the drawn body is ~55x96 anchored on the foot
         self.h = 116
@@ -1822,9 +1827,15 @@ class Zombie:
         self.enraged = False
         self.rage_dmg = 0
         self.rage_threshold = 90
-        # Pole Vaulting Zombie: one jump over the first plant
+        # Pole Vaulting Zombie: one jump over the first plant. The leap is a
+        # dt-driven arc (see update): the old single-frame x-snap teleported
+        # ~180px and froze mid-air, which read as a teleport.
         self.has_vaulted = False
         self.vault_timer = 0
+        self.vault_t = 0.0
+        self._vault_from_x = 0.0
+        self._vault_to_x = 0.0
+        self.vault_lift = 0.0   # visual hop offset, applied in draw()
         # Boss: summons minions
         self.summon_timer = 3.0
         self.minion_pool = [ZOMBIE_BASIC, ZOMBIE_CONEHEAD]
@@ -1833,9 +1844,13 @@ class Zombie:
         # Balloon Zombie: floats over plants and mowers until the balloon pops
         self.floating = (zombie_type == ZOMBIE_BALLOON)
         self.balloon_hp = BALLOON_HP if self.floating else 0
+        # Rendered hover offset, eased toward ±target in update() so the pop
+        # (and spawn entry) glides instead of snapping 24px in one frame.
+        self._air_lift = 24.0 if self.floating else 0.0
         # Bungee Zombie: drops from the sky on a cord and steals a plant
         self.is_bungee = (zombie_type == ZOMBIE_BUNGEE)
         self.bungee_phase = "descend" if self.is_bungee else None
+        self.escaped = False   # bungee that climbed off-screen (no kill reward)
         self._steal_timer = 0.0
         self.stole_plant = False
         self.steal_announced = False
@@ -1906,6 +1921,15 @@ class Zombie:
         if self.hit_flash > 0:
             self.hit_flash -= dt
         self.anim_time += dt
+        # Ease the rendered hover lift toward the floating target (0 when the
+        # balloon pops) so the descent is a glide, not a 24px one-frame snap.
+        _lift_target = 24.0 if self.floating else 0.0
+        if self._air_lift != _lift_target:
+            step = dt / 0.15
+            if self._air_lift > _lift_target:
+                self._air_lift = max(_lift_target, self._air_lift - 24.0 * step)
+            else:
+                self._air_lift = min(_lift_target, self._air_lift + 24.0 * step)
         if self.rally_timer > 0:
             self.rally_timer -= dt
             if self.rally_timer <= 0:
@@ -1988,18 +2012,30 @@ class Zombie:
         if (self.zombie_type == ZOMBIE_POLE and not self.has_vaulted
                 and blocking_plant is not None):
             self.has_vaulted = True
-            # Place the zombie's right edge just left of the plant. This avoids
-            # tunnelling through two cells while still clearing the first plant.
-            self.x = blocking_plant.x - self.w - 8
-            self.vault_timer = 0.35
-            self.speed = 15
+            # Land with the right edge just left of the plant (same semantic
+            # as before: clears the first plant without tunnelling two cells)
+            # but travel there on a dt-driven arc instead of a single-frame
+            # x-snap, and keep the wave speed scaled after landing.
+            self._vault_from_x = self.x
+            self._vault_to_x = blocking_plant.x - self.w - 8
+            self.vault_timer = POLE_VAULT_T
+            self.vault_t = 0.0
             self.is_eating = False
             self.eat_timer = 0
             return None
 
         if self.vault_timer > 0:
             self.vault_timer -= dt
-            # landing — hold position for a moment
+            k = min(1.0, 1.0 - max(0.0, self.vault_timer) / POLE_VAULT_T)
+            ease = k * k * (3.0 - 2.0 * k)
+            self.x = self._vault_from_x + (self._vault_to_x - self._vault_from_x) * ease
+            self.vault_lift = math.sin(k * math.pi) * POLE_VAULT_LIFT
+            if self.vault_timer <= 0:
+                self.x = self._vault_to_x
+                self.vault_lift = 0.0
+                # Post-vault shuffle: relative to the zombie's scaled speed so
+                # late-wave poles stay late-wave fast.
+                self.speed = self.base_speed * self._speed_mult * POLE_VAULT_LAND_MULT
             return None
 
         # Boss: periodically request a minion spawn. The game appends it after
@@ -2332,8 +2368,10 @@ class Zombie:
                 # foot line (see assets_loader.frame_body) so a zombie never
                 # changes size or foot point when its state changes.
                 VH = ZOMBIE_BODY_H
-                if self.floating:
-                    foot_y -= 24      # airborne body hovers above the lawn
+                if self._air_lift > 0.1 or self.floating:
+                    foot_y -= self._air_lift   # airborne body hovers above the lawn
+                if self.vault_lift > 0.1:
+                    foot_y -= self.vault_lift  # mid-vault hop arc
                 if self.is_bungee:
                     foot_y = self.y + 92   # hanging under the cord
                 if self.body_tint is not None:
@@ -2728,7 +2766,8 @@ class Zombie:
                 overflow = -self.balloon_hp
                 self.balloon_hp = 0
                 self.floating = False
-                self.speed = 16  # grounded shuffle
+                # Grounded shuffle stays proportional to the wave-scaled speed.
+                self.speed = self.base_speed * self._speed_mult * BALLOON_LAND_MULT
                 self.hp = self.max_hp - BALLOON_HP - overflow
                 # tell the game layer to emit a balloon-pop particle burst
                 self._balloon_popped = True
@@ -2741,7 +2780,9 @@ class Zombie:
             self.rage_dmg += dmg
             if self.rage_dmg >= self.rage_threshold:
                 self.enraged = True
-                self.speed = max(self.base_speed * 3.0, 30)
+                # 3x the *scaled* walk speed, not the raw base: late-wave
+                # newspapers must not regress to early-game absolute speeds.
+                self.speed = self.base_speed * self._speed_mult * 3.0
                 self._play_anger = True
         if self.hp <= 0 and self.dying_timer <= 0:
             self.dying_timer = 1.0  # play dying animation 1 second
@@ -2750,6 +2791,7 @@ class Zombie:
 def create_zombie(x, y, row, zombie_type=ZOMBIE_BASIC, speed_mult=1.0, dmg_mult=1.0):
     """Spawn a zombie; speed/eat-damage multipliers power survival scaling."""
     z = Zombie(x, y, row, zombie_type)
+    z._speed_mult = speed_mult
     if speed_mult != 1.0 and not z.is_bungee:
         z.speed = z.base_speed * speed_mult
     if dmg_mult != 1.0:

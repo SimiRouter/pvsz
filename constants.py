@@ -144,6 +144,10 @@ ZOMBIE_INFO = {
 # --- AI tuning -------------------------------------------------------------
 TACTICIAN_TRANSFER_S = 5.5     # seconds between lane evaluations
 TACTICIAN_TRANSFER_T = 0.55    # how long the hop animation lasts
+POLE_VAULT_T = 0.45            # pole-vault leap duration (dt-driven arc)
+POLE_VAULT_LIFT = 34.0         # visual hop height of the vault arc
+POLE_VAULT_LAND_MULT = 0.577   # post-vault shuffle (≈15 px/s at base 26)
+BALLOON_LAND_MULT = 0.667      # grounded shuffle (≈16 px/s at base 24)
 DIGGER_BURROW_S = 1.1          # dive/emerge animation time
 DIGGER_SPEED_MULT = 1.5        # underground travel is faster
 DIGGER_MIN_TUNNEL = 90.0       # px of tunnelling even with no plants to pass
