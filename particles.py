@@ -494,11 +494,16 @@ class Effects:
         elif kind == "leaf":
             img = _leaf(p.color, p.size * (1.0 - 0.3 * t))
             if p.rot:
-                img = pygame.transform.rotate(img, p.rot)
+                # p.rot accumulates in radians (spin is rad/s) but
+                # transform.rotate takes degrees — converting here makes the
+                # 15° bins actually advance during the particle's lifetime.
+                img = _leaf_rotated(p.color, p.size * (1.0 - 0.3 * t),
+                                    math.degrees(p.rot))
         elif kind == "shred":
             img = _shred(p.color, p.size * (1.0 - 0.2 * t))
             if p.rot:
-                img = pygame.transform.rotate(img, p.rot)
+                img = _shred_rotated(p.color, p.size * (1.0 - 0.2 * t),
+                                     math.degrees(p.rot))
         elif kind == "chunk":
             img = _dot(p.color, p.size * (1.0 - 0.3 * t))
         else:
