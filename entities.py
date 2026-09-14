@@ -2254,6 +2254,9 @@ class Zombie:
         else:  # climb back up with the loot
             self.y -= total / BUNGEE_CLIMB_S * dt
             if self.y < -260:
+                # Climbed off with the loot — an escape, not a death; the
+                # game's settlement skips rewards for escaped zombies.
+                self.escaped = True
                 self.alive = False
         return None
 

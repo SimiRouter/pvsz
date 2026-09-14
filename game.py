@@ -1702,7 +1702,7 @@ class Game:
             hit = False
             for z in self.zombies:
                 if (not z.alive or z.hp <= 0 or z.dying_timer > 0
-                        or z.row != proj.row):
+                        or z.underground or z.row != proj.row):
                     continue
                 if proj.swept_rect().colliderect(z.rect()):
                     z.take_damage(proj.damage)
@@ -1824,6 +1824,13 @@ class Game:
         for z in dead_zombies:
             if not z.death_counted:
                 z.death_counted = True
+                if z.escaped:
+                    # A bungee that climbed off-screen released its wave slot
+                    # (otherwise the wave would never clear) but it was never
+                    # killed: no sun reward, no death FX, no kill sound.
+                    if z.in_wave:
+                        self.wave.zombie_died()
+                    continue
                 if z.is_boss:
                     self.add_shake(10)
                     self.flash_timer = 0.1
