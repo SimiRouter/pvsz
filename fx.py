@@ -162,10 +162,8 @@ class WaveWarning:
         # as a black square dropped on the lawn in front of the entering
         # zombies (用户报的"僵尸前头脚下的黑方块") — softer corners and a
         # lighter wash make it read as a banner backdrop instead.
-        backdrop = pygame.Surface((bw, bh), pygame.SRCALPHA)
-        pygame.draw.rect(backdrop, (0, 0, 0, int(120 * fade_in * fade_out)),
-                         (0, 0, bw, bh), border_radius=18)
-        screen.blit(backdrop, (bx, by))
+        alpha_rect(screen, (0, 0, 0, int(120 * fade_in * fade_out)),
+                   (bx, by, bw, bh), radius=18)
         main = faded(self._main, alpha)
         screen.blit(main, (SCREEN_WIDTH // 2 - main.get_width() // 2, by + 12))
         if self._sub is not None:
@@ -203,6 +201,43 @@ def _explosion_blob(step):
             a = int(90 * (1 - i / (layers + 1)))
             pygame.draw.circle(img, (*color[:3], a), (cx, cy), rr)
     _text_cache[key] = img
+    return img
+
+
+_explosion_shock_cache = {}
+_explosion_scaled_cache = {}
+
+
+def _shock_sprite(radius):
+    """White→orange expanding ring at full alpha; the caller fades it.
+
+    The ring's radius eases out smoothly, so quantize it onto a 4px ladder —
+    the same texture serves neighbouring frames instead of a fresh SRCALPHA
+    surface + two stroked circles every frame."""
+    rq = max(2, (int(radius) // 4) * 4)
+    key = ("shock", rq)
+    img = _explosion_shock_cache.get(key)
+    if img is None:
+        img = pygame.Surface((rq * 2, rq * 2), pygame.SRCALPHA)
+        pygame.draw.circle(img, (255, 255, 255, 255), (rq, rq), rq, 4)
+        pygame.draw.circle(img, (255, 180, 60, 153),
+                           (rq, rq), int(rq * 0.78), 2)
+        _explosion_shock_cache[key] = img
+    return img
+
+
+def _explosion_scaled(step, size):
+    """Fireball blob pre-scaled to a quantized pixel size.
+
+    The old draw path smoothscaled the 256px cached blob to a new size every
+    frame (and set_alpha'd the result). Baking the scale once per (step,
+    16px-ladder size) turns steady-state into one cached blit + memoized fade."""
+    sq = max(4, (int(size) // 16) * 16)
+    key = ("_blob_scaled", step, sq)
+    img = _explosion_scaled_cache.get(key)
+    if img is None:
+        img = pygame.transform.smoothscale(_explosion_blob(step), (sq, sq))
+        _explosion_scaled_cache[key] = img
     return img
 
 
@@ -244,26 +279,21 @@ class Explosion:
         # Bright white→orange ring expanding outward, ease-out + thin stroke.
         shock_t = min(1.0, self.age / (self.duration * 0.85))
         shock_ease = 1.0 - (1.0 - shock_t) ** 2
-        shock_r = int(self.radius * 1.55 * shock_ease)
+        shock_r = self.radius * 1.55 * shock_ease
         shock_alpha = int(220 * (1.0 - shock_t))
         if shock_r > 2 and shock_alpha > 0:
-            s = pygame.Surface((shock_r * 2, shock_r * 2), pygame.SRCALPHA)
-            pygame.draw.circle(s, (255, 255, 255, shock_alpha),
-                               (shock_r, shock_r), shock_r, 4)
-            # inner darker ring for layered look
-            pygame.draw.circle(s, (255, 180, 60, int(shock_alpha * 0.6)),
-                               (shock_r, shock_r), int(shock_r * 0.78), 2)
-            screen.blit(s, (int(self.x) - shock_r, int(self.y) - shock_r))
+            s = _shock_sprite(shock_r)
+            img = fade_cache.faded(s, shock_alpha)
+            screen.blit(img, img.get_rect(center=(int(self.x), int(self.y))))
         # ---- fireball blob ----
         # ease-out growth, ease-in fade
         grow = 1.0 - (1.0 - t) ** 2
         step = int(grow * 15)
-        blob = _explosion_blob(step)
         size = int(self.radius * 2 * (0.35 + 0.65 * grow))
-        img = pygame.transform.smoothscale(blob, (size, size))
+        img = _explosion_scaled(step, size)
         alpha = int(255 * (1.0 - t) ** 1.2)
-        img.set_alpha(alpha)
-        screen.blit(img, img.get_rect(center=(int(self.x), int(self.y))))
+        screen.blit(fade_cache.faded(img, alpha),
+                    img.get_rect(center=(int(self.x), int(self.y))))
         # sparks
         for p in self.particles:
             r = max(1, int(p[4] * (1 - t)))

@@ -120,6 +120,91 @@ def _shred(color, radius):
     return img
 
 
+_rot_cache = {}
+
+#: Rotated leaf/shred variants key on a continuously-shrinking radius crossed
+#: with a 24-bin angle, so unlike the base sprite caches this key space is not
+#: naturally bounded. Cap it the same way ``_beam_cache`` is capped: on
+#: overflow drop everything — live particles re-cache one rotate next frame,
+#: which is invisible, whereas unbounded growth is a slow leak under endless
+#: survival churn.
+_ROT_CACHE_MAX = 256
+
+
+def _rot_cached(key, make):
+    img = _rot_cache.get(key)
+    if img is None:
+        if len(_rot_cache) >= _ROT_CACHE_MAX:
+            _rot_cache.clear()
+        img = _rot_cache[key] = make()
+    return img
+
+
+def _leaf_rotated(color, radius, rot):
+    """Cached 15°-step variants of a rotated leaf, so a spinning burst never
+    allocates a ``transform.rotate`` per particle per frame (the old draw
+    path re-rotated every leaf every frame while its spin ran)."""
+    return _rot_cached(
+        ("leaf", color, _quantize(radius), int((rot % 360) / 15)),
+        lambda: pygame.transform.rotate(_leaf(color, radius), rot))
+
+
+def _shred_rotated(color, radius, rot):
+    """See :func:`_leaf_rotated` — same 15° ladder for balloon shreds."""
+    return _rot_cached(
+        ("shred", color, _quantize(radius), int((rot % 360) / 15)),
+        lambda: pygame.transform.rotate(_shred(color, radius), rot))
+
+
+_print_cache = {}
+
+
+def _print_sprite(color, w, h):
+    """A pressed-grass footprint at a fixed size, cached per (colour, w, h).
+
+    The old draw path ``transform.scale`` + ``set_alpha`` ran once per print
+    per frame — scaling a blurry puff and stamping a persistent alpha on the
+    result. Building the squashed puff here once per (size * colour) means a
+    steady lawn only does ``_faded`` (memoized) + blit per footprint."""
+    key = ("print", color, w, h)
+    img = _print_cache.get(key)
+    if img is None:
+        base = _puff(color, w / 2.0)
+        img = pygame.transform.scale(base, (w, h))
+        _print_cache[key] = img
+    return img
+
+
+#: Beams sweep across a lawn as sources and targets move, so a beam cache has
+#: no natural size ceiling. Bound it; on overflow drop the whole set — the few
+#: live beams re-cache on the next frame, so eviction is invisible.
+_BEAM_CACHE_MAX = 192
+_beam_cache = {}
+
+
+def _beam_sprite(color, x1, y1, x2, y2, alpha, w):
+    """A mending/rally beam between two fixed points at a fixed alpha, cached.
+
+    The endpoints are pre-quantized by the caller, so one beam's flicker only
+    re-keys every ~4px of travel — the same texture is reused across frames
+    instead of a fresh SRCALPHA surface + two strokes every frame."""
+    key = ("beam", color, x1, y1, x2, y2, alpha, w)
+    surf = _beam_cache.get(key)
+    if surf is None:
+        if len(_beam_cache) >= _BEAM_CACHE_MAX:
+            _beam_cache.clear()
+        surf = pygame.Surface((abs(x2 - x1) + w * 2 + 2, abs(y2 - y1) + w * 2 + 2),
+                              pygame.SRCALPHA)
+        ox = min(x1, x2) - w - 1
+        oy = min(y1, y2) - w - 1
+        pygame.draw.line(surf, (*color, alpha),
+                         (x1 - ox, y1 - oy), (x2 - ox, y2 - oy), w)
+        pygame.draw.line(surf, (255, 255, 255, alpha // 2),
+                         (x1 - ox, y1 - oy), (x2 - ox, y2 - oy), max(1, w // 3))
+        _beam_cache[key] = surf
+    return surf
+
+
 _ring_cache = {}
 
 
@@ -435,10 +520,13 @@ class Effects:
             return
         w = int(p.size * (1.0 + 0.25 * t))
         h = max(3, int(p.r0 * (1.0 + 0.25 * t)))
-        img = _puff(p.color, w / 2.0)
-        img = pygame.transform.scale(img, (w, h))
-        img.set_alpha(alpha)
-        screen.blit(img, img.get_rect(center=(int(p.x), int(p.y))))
+        # Quantize the size pair onto a coarse ladder so the scale cache
+        # stays small (a footprint is ~30x13 and grows 25% — ~6 entries).
+        wq = ((w + 2) // 4) * 4
+        hq = max(3, ((h + 1) // 2) * 2)
+        img = _print_sprite(p.color, wq, hq)
+        # Never set_alpha on the shared cached sprite — fade via copy.
+        screen.blit(_faded(img, alpha), img.get_rect(center=(int(p.x), int(p.y))))
 
     def _draw_ring(self, screen, p):
         t = 1.0 - p.life / p.max_life
@@ -456,14 +544,12 @@ class Effects:
         alpha = max(0, min(255, alpha))
         if alpha <= 0:
             return
-        x1, y1, x2, y2 = int(p.x), int(p.y), int(p.x2), int(p.y2)
         w = max(2, int(p.width * (1.0 - 0.4 * t)))
-        surf = pygame.Surface((abs(x2 - x1) + w * 2 + 2, abs(y2 - y1) + w * 2 + 2),
-                              pygame.SRCALPHA)
-        ox = min(x1, x2) - w - 1
-        oy = min(y1, y2) - w - 1
-        pygame.draw.line(surf, (*p.color, alpha),
-                         (x1 - ox, y1 - oy), (x2 - ox, y2 - oy), w)
-        pygame.draw.line(surf, (255, 255, 255, alpha // 2),
-                         (x1 - ox, y1 - oy), (x2 - ox, y2 - oy), max(1, w // 3))
-        screen.blit(surf, (ox, oy))
+        # Constant-grid beam: quantize size + colour so the scratch surface
+        # (and its two strokes) is cached per frame-instance rather than
+        # freshly allocated for every particle every frame.
+        wq = ((w + 1) // 2) * 2
+        x1q, y1q = int(p.x) & ~3, int(p.y) & ~3
+        x2q, y2q = int(p.x2) & ~3, int(p.y2) & ~3
+        surf = _beam_sprite(p.color, x1q, y1q, x2q, y2q, alpha, wq)
+        screen.blit(surf, (min(x1q, x2q) - wq - 1, min(y1q, y2q) - wq - 1))

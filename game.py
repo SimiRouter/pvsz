@@ -8,7 +8,7 @@ from entities import *
 from grid import Grid
 from wave import WaveSystem
 from ui import *
-from fx import FloatingText, WaveWarning, Explosion, cached_text
+from fx import FloatingText, WaveWarning, Explosion, cached_text, alpha_rect
 import assets_loader
 assets_loader.init()
 from levels import *
@@ -105,6 +105,9 @@ class Game:
         # Scratch surfaces for particle drawing — keyed by (w, h) to avoid
         # allocating tiny SRCALPHA surfaces every frame.
         self._scratch_cache = {}
+        # Cached 45°-step tilt variants of the coin's "$" mark, so the coin
+        # pop never allocates a transform.rotate per coin per frame.
+        self._coin_mark_cache = {}
         # Reusable translucent layers (avoid allocating full-screen surfaces every frame)
         self._seed_bar_surface = pygame.Surface((SCREEN_WIDTH, UI_BAR_H), pygame.SRCALPHA)
         self._seed_bar_surface.fill((70, 50, 30, 230))
@@ -1982,13 +1985,21 @@ class Game:
                                (r + 1 - 2, r + 1 - 2), max(2, r // 2))
             # dark rim
             pygame.draw.circle(coin, (180, 130, 30, alpha), (r + 1, r + 1), r, 2)
-            # "$" mark on the face — small dark ellipse rotated
-            mark = self._get_scratch(r, r)
-            pygame.draw.ellipse(mark, (130, 95, 25, int(alpha * 0.9)),
-                                (r // 3, 1, r // 3, r - 2))
-            mark = pygame.transform.rotate(mark, math.degrees(c["rot"]))
-            coin.blit(mark, ((r * 2 + 2 - mark.get_width()) // 2,
-                             (r * 2 + 2 - mark.get_height()) // 2))
+            # "$" mark on the face — small dark ellipse, rotated to a cached
+            # 45°-step variant (transform.rotate allocates; cache it). The
+            # mark's own alpha bakes into its pixels, so the key carries it.
+            ma = int(alpha * 0.9)
+            slot = int(c["rot"] * 4 / math.tau) % 8
+            key = (r, ma, slot)
+            dot_mark = self._coin_mark_cache.get(key)
+            if dot_mark is None:
+                mark = self._get_scratch(r, r)
+                pygame.draw.ellipse(mark, (130, 95, 25, ma),
+                                    (r // 3, 1, r // 3, r - 2))
+                dot_mark = pygame.transform.rotate(mark, slot * 45)
+                self._coin_mark_cache[key] = dot_mark
+            coin.blit(dot_mark, ((r * 2 + 2 - dot_mark.get_width()) // 2,
+                                 (r * 2 + 2 - dot_mark.get_height()) // 2))
             self.screen.blit(coin, (cx - r - 1, cy - r - 1))
 
         # explosions (cherry bombs / boss deaths)
@@ -2077,7 +2088,7 @@ class Game:
             secs = max(0, (self.wave.between_wave_duration - self.wave.between_wave_timer))
             t = cached_text(i18n.fmt_get_ready(secs), 32, COLOR_WHITE, outline=(0, 0, 0))
             bg = pygame.Rect(SCREEN_WIDTH // 2 - t.get_width() // 2 - 10, 10, t.get_width() + 20, t.get_height() + 10)
-            pygame.draw.rect(self.screen, (0, 0, 0, 180), bg, border_radius=6)
+            alpha_rect(self.screen, (0, 0, 0, 180), bg, radius=6)
             self.screen.blit(t, (SCREEN_WIDTH // 2 - t.get_width() // 2, 15))
 
         # explosion white flash (brief, right after detonation)
