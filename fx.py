@@ -19,6 +19,11 @@ from constants import COLOR_WHITE, COLOR_RED, COLOR_YELLOW, SCREEN_WIDTH
 # Cached text rendering
 # ---------------------------------------------------------------
 _text_cache = {}
+# Endless mode keeps minting new strings every wave (wave banners, sun
+# counters), so an unbounded dict leaks slowly forever. The hot set is tiny
+# (a few hundred strings across the whole UI); on overflow, drop the oldest
+# inserts. A miss is just one font render — self-healing, never wrong.
+_TEXT_CACHE_MAX = 2048
 
 
 def cached_text(text, size, color, outline=None):
@@ -38,6 +43,9 @@ def cached_text(text, size, color, outline=None):
                     comp.blit(font.render(text, True, outline), (2 + dx, 2 + dy))
         comp.blit(surf, (2, 2))
         surf = comp
+    if len(_text_cache) >= _TEXT_CACHE_MAX:
+        for old in list(_text_cache)[:_TEXT_CACHE_MAX // 2]:
+            _text_cache.pop(old, None)
     _text_cache[key] = surf
     return surf
 

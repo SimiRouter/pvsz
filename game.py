@@ -422,6 +422,10 @@ class Game:
         self._generate_survival_waves()
         self.wave.grid_y = self.grid.y
 
+        # Warm the body-sprite cache before the first wave walks on, same as
+        # the adventure path — survival fields every sheet variant from wave 1.
+        self._preload_level_sprites()
+
         # shovel
         self.shovel = Shovel()
 
