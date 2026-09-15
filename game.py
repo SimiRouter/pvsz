@@ -1037,6 +1037,16 @@ class Game:
             self._retry_current()
         elif action == "menu":
             self._record_survival_run()
+            # Drop every half-finished interaction so returning to play has
+            # no phantom card drag, no armed Cob, no shovel, and no hidden
+            # OS cursor. Mirrors the resume path's reset (game.py L482-490).
+            self._press = None
+            self._cob_armed = None
+            if self.shovel is not None:
+                self.shovel.selected = False
+            for b in self.seed_buttons:
+                b.selected = False
+            self._refresh_cursor()
             self.state = STATE_MENU
 
     def _retry_current(self):
@@ -1745,7 +1755,11 @@ class Game:
             # Walking zombie takes a step → drop a faint grass print.
             if getattr(z, "_step_just_done", False) and z.alive and z.dying_timer <= 0:
                 z._step_just_done = False
-                if not z.floating and not z.reached_house:
+                # Underground diggers are invisible by design — leaving prints
+                # while they tunnel would spoil the surprise AND look like a
+                # ghost walking on the lawn.
+                if (not z.floating and not z.reached_house
+                        and not getattr(z, "underground", False)):
                     self._spawn_grass_print(z)
             # AI zombie reaction hooks (heal beam, rally pulse, lane hop,
             # digger dust). Emitted here so entities stay free of the FX layer.

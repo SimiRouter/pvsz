@@ -2232,6 +2232,10 @@ class Zombie:
 
     def _update_bungee(self, dt, plants):
         """Sky-drop state machine: descend → steal a plant → climb away."""
+        # Speed-mult scaling: the bungee's descend/climb velocities are a
+        # fixed pixel/s, so the only knob to honour survival-mode / wave
+        # speed multipliers is dt itself.
+        dt = dt * getattr(self, "_speed_mult", 1.0)
         target_y = self.grid_y + self.row * CELL_H + 15
         total = target_y + 250
         if self.bungee_phase == "descend":
