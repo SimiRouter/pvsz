@@ -18,8 +18,11 @@ class SaveData:
         }
 
     # ---------- persistence ----------
+    SCHEMA_VERSION = 1
+
     def to_dict(self):
         return {
+            "schema_version": self.SCHEMA_VERSION,
             "completed_levels": self.completed_levels,
             "survival_best": self.survival_best,
             "settings": self.settings,
@@ -33,6 +36,7 @@ class SaveData:
         try:
             with open(SAVE_PATH, "r", encoding="utf-8") as f:
                 raw = json.load(f)
+            raw = cls._migrate(raw)
             data.completed_levels = list(raw.get("completed_levels", []))
             data.survival_best = dict(raw.get("survival_best", {}))
             data.settings.update(raw.get("settings", {}))
@@ -42,6 +46,37 @@ class SaveData:
                 os.replace(SAVE_PATH, SAVE_PATH + ".corrupt")
             except OSError:
                 pass
+        return data
+
+    @classmethod
+    def _migrate(cls, raw):
+        """Forward-migrate a raw dict read from disk into the current schema.
+
+        Legacy saves (pre-schema_version) used the same three keys as v1, so
+        the v0 → v1 path is effectively a no-op pass-through — but the version
+        bump is what lets future changes branch safely on `d["schema_version"]`.
+        """
+        if not isinstance(raw, dict):
+            return {"schema_version": cls.SCHEMA_VERSION}
+        if raw.get("schema_version", 0) < cls.SCHEMA_VERSION:
+            raw = dict(raw)
+            raw["schema_version"] = cls.SCHEMA_VERSION
+        return raw
+
+    @classmethod
+    def from_dict(cls, d):
+        """Construct a SaveData from an arbitrary dict, applying migrations.
+
+        Useful for tests and for callers that already hold the parsed JSON.
+        Unknown keys are ignored; missing keys take defaults.
+        """
+        data = cls()
+        if not isinstance(d, dict):
+            return data
+        d = cls._migrate(d)
+        data.completed_levels = list(d.get("completed_levels", []))
+        data.survival_best = dict(d.get("survival_best", {}))
+        data.settings.update(d.get("settings", {}))
         return data
 
     def save(self):
